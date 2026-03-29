@@ -12,11 +12,11 @@ def layout() -> html.Div:
                     html.Div("Alerts & Market Intelligence", className="hero-kicker"),
                     html.H1("Monitoring Layer", className="page-title"),
                     html.P(
-                        "Watch negative sentiment drops, unusual news flow, and watchlist movement in one operational view.",
+                        "Track the watchlist for weaker sentiment, unusual coverage, and meaningful shifts without turning the page into another overview screen.",
                         className="page-subtitle",
                     ),
                 ],
-                className="section-shell mb-3",
+                className="section-shell page-header-shell mb-3",
             ),
             dbc.Row(
                 [
@@ -29,7 +29,7 @@ def layout() -> html.Div:
                             ],
                             className="section-shell",
                         ),
-                        md=7,
+                        lg=7,
                     ),
                     dbc.Col(
                         html.Div(
@@ -40,17 +40,48 @@ def layout() -> html.Div:
                             ],
                             className="section-shell",
                         ),
-                        md=5,
+                        lg=5,
                     ),
                 ],
                 className="g-3 mb-3",
             ),
             dbc.Row(
                 [
-                    dbc.Col(html.Div(dcc.Graph(id="alerts-sector-heatmap"), className="chart-card"), md=6),
-                    dbc.Col(html.Div(dcc.Graph(id="alerts-shift-chart"), className="chart-card"), md=6),
+                    dbc.Col(
+                        html.Div(
+                            [
+                                html.Div("Sentiment Trend", className="section-kicker"),
+                                html.H3("Recent Shifts", className="section-title"),
+                                dcc.Graph(id="alerts-shift-chart"),
+                            ],
+                            className="chart-card",
+                        ),
+                        lg=12,
+                    ),
                 ],
-                className="g-3 mb-4",
+                className="g-3 mb-3",
             ),
-        ]
+            dbc.Accordion(
+                [
+                    dbc.AccordionItem(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Sector Mood", className="section-kicker"),
+                                    html.H3("Optional Macro View", className="section-title"),
+                                    dcc.Graph(id="alerts-sector-heatmap"),
+                                ],
+                                className="chart-card compact-chart-card",
+                            )
+                        ],
+                        title="Open sector heatmap",
+                        item_id="alerts-sector",
+                    )
+                ],
+                start_collapsed=True,
+                always_open=False,
+                className="page-accordion mb-4",
+            ),
+        ],
+        className="analysis-page",
     )

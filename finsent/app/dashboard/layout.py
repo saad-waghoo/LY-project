@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dash import dcc, html
 
-from finsent.app.dashboard.components import build_filter_bar, build_footer, build_landing_search, build_navbar
+from finsent.app.dashboard.components import build_footer, build_landing_search, build_navbar, build_workspace_bar
 
 
 def build_app_layout(default_ticker: str) -> html.Div:
@@ -14,22 +14,21 @@ def build_app_layout(default_ticker: str) -> html.Div:
                 storage_type="session",
                 data={
                     "focus_ticker": default_ticker,
-                    "compare_tickers": ["MSFT", "NVDA"],
+                    "compare_tickers": [],
                     "horizon": "medium",
-                    "start_date": None,
-                    "end_date": None,
+                    "date_window": "30d",
                     "alert_threshold": 40,
+                    "analysis_ready": False,
                 },
             ),
             build_navbar(),
             html.Div(build_landing_search(default_ticker), id="landing-controls-container"),
             html.Div(
-                build_filter_bar(
+                build_workspace_bar(
                     focus_ticker=default_ticker,
-                    compare_tickers=["MSFT", "NVDA"],
+                    compare_tickers=[],
                     horizon="medium",
-                    start_date=None,
-                    end_date=None,
+                    date_window="30d",
                     alert_threshold=40,
                 ),
                 id="top-controls-container",

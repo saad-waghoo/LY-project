@@ -27,7 +27,11 @@ def align_news_with_prices(
         left_on="published_at",
         right_on="market_timestamp",
         direction="backward",
+        tolerance=pd.Timedelta(days=2),
     )
+    merged = merged.dropna(subset=["market_timestamp", "entry_close"]).copy()
+    if merged.empty:
+        return pd.DataFrame()
 
     future_prices = work_prices[["timestamp", "close"]].rename(
         columns={"timestamp": "future_timestamp", "close": "future_close"}
@@ -42,7 +46,12 @@ def align_news_with_prices(
         left_on="target_timestamp",
         right_on="future_timestamp",
         direction="forward",
+        tolerance=max(pd.Timedelta(minutes=return_window_minutes), pd.Timedelta(days=2)),
     )
+
+    future_merged = future_merged.dropna(
+        subset=["market_timestamp", "entry_close", "future_timestamp", "future_close"]
+    ).copy()
 
     future_merged["forward_return"] = (
         future_merged["future_close"] - future_merged["entry_close"]

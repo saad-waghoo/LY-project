@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dash_bootstrap_components as dbc
-from dash import dash_table, dcc, html
+from dash import dcc, html
 
 
 def layout() -> html.Div:
@@ -12,66 +12,67 @@ def layout() -> html.Div:
                     html.Div("Compare Stocks", className="hero-kicker"),
                     html.H1("Side-by-Side Signal Comparison", className="page-title"),
                     html.P(
-                        "Compare stocks across sentiment, return, news volume, and confidence.",
+                        "Measure the selected ticker against a small peer set across sentiment quality, price movement, and news intensity.",
                         className="page-subtitle",
                     ),
                 ],
-                className="section-shell mb-3",
+                className="section-shell page-header-shell mb-3",
             ),
-            dbc.Row(id="compare-metric-row", className="g-3 mb-3"),
-            dbc.Row(
-                [dbc.Col(html.Div(dcc.Graph(id="compare-main-chart"), className="chart-card"), md=12)],
-                className="g-3 mb-3",
-            ),
-            dbc.Row(
+            html.Div(id="compare-empty-state", className="mb-3"),
+            html.Div(
                 [
-                    dbc.Col(html.Div(dcc.Graph(id="compare-sentiment-chart"), className="chart-card"), md=6),
-                    dbc.Col(html.Div(dcc.Graph(id="compare-price-chart"), className="chart-card"), md=6),
-                ],
-                className="g-3 mb-3",
-            ),
-            dbc.Row(
-                [
-                    dbc.Col(
-                        html.Div(
-                            [
-                                dash_table.DataTable(
-                                    id="compare-table",
-                                    page_size=6,
-                                    style_table={"overflowX": "auto"},
-                                    style_cell={
-                                        "textAlign": "left",
-                                        "padding": "10px 12px",
-                                        "fontFamily": "Trebuchet MS, sans-serif",
-                                        "backgroundColor": "#0c1729",
-                                        "color": "#e8eefb",
-                                        "border": "1px solid #22314e",
-                                    },
-                                    style_header={
-                                        "backgroundColor": "#13213a",
-                                        "fontWeight": "700",
-                                        "color": "#dce7ff",
-                                        "border": "1px solid #22314e",
-                                    },
+                    html.Div(id="compare-selection-summary", className="compare-selection-summary mb-3"),
+                    dbc.Row(id="compare-metric-row", className="g-3 mb-3"),
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                html.Div(
+                                    [
+                                        html.Div("Relative Performance", className="section-kicker"),
+                                        html.H3("Indexed Price Performance", className="section-title"),
+                                        html.P(
+                                            "All selected tickers are rebased to 100 so the price move is actually comparable.",
+                                            className="section-helper",
+                                        ),
+                                        dcc.Graph(id="compare-main-chart"),
+                                    ],
+                                    className="chart-card",
                                 ),
-                            ],
-                            className="section-shell",
-                        ),
-                        md=7,
+                                lg=8,
+                            ),
+                            dbc.Col(
+                                html.Div(
+                                    [
+                                        html.Div("Comparison Brief", className="section-kicker"),
+                                        html.H3("What Actually Matters", className="section-title"),
+                                        html.P(
+                                            "A short read on leadership, weakness, and signal quality across the selected names.",
+                                            className="section-helper",
+                                        ),
+                                        html.Div(id="compare-ai-summary", className="explanation-box"),
+                                    ],
+                                    className="section-shell explanation-shell",
+                                ),
+                                lg=4,
+                            )
+                        ],
+                        className="g-3 mb-3",
                     ),
-                    dbc.Col(
-                        html.Div(
-                            [
-                                html.Div("AI Comparison Summary", className="section-kicker"),
-                                html.H3("Who Leads This Window", className="section-title"),
-                                html.Div(id="compare-ai-summary", className="summary-stack"),
-                            ],
-                            className="section-shell explanation-shell",
-                        ),
-                        md=5,
+                    html.Div(
+                        [
+                            html.Div("Signal Snapshot", className="section-kicker"),
+                            html.H3("Sentiment, Return, and Confidence", className="section-title"),
+                            html.P(
+                                "Use this to compare signal quality without digging through tables.",
+                                className="section-helper",
+                            ),
+                            dcc.Graph(id="compare-secondary-chart"),
+                        ],
+                        className="chart-card compact-chart-card mb-4",
                     ),
                 ],
-                className="g-3 mb-4",
+                id="compare-content",
             ),
-        ]
+        ],
+        className="analysis-page",
     )

@@ -79,16 +79,22 @@ class PriceRepository:
 
     def upsert_price_bars(self, ticker: str, price_frame: pd.DataFrame) -> None:
         ticker = ticker.upper()
+        timestamps = [timestamp.to_pydatetime() for timestamp in price_frame.index]
+        existing_rows = self.session.execute(
+            select(PriceBar).where(
+                PriceBar.ticker == ticker,
+                PriceBar.timestamp.in_(timestamps),
+            )
+        ).scalars().all()
+        existing_by_timestamp = {row.timestamp: row for row in existing_rows}
+
         for timestamp, row in price_frame.iterrows():
-            price_bar = self.session.execute(
-                select(PriceBar).where(
-                    PriceBar.ticker == ticker,
-                    PriceBar.timestamp == timestamp.to_pydatetime(),
-                )
-            ).scalar_one_or_none()
+            dt = timestamp.to_pydatetime()
+            price_bar = existing_by_timestamp.get(dt)
             if price_bar is None:
-                price_bar = PriceBar(ticker=ticker, timestamp=timestamp.to_pydatetime())
+                price_bar = PriceBar(ticker=ticker, timestamp=dt)
                 self.session.add(price_bar)
+                existing_by_timestamp[dt] = price_bar
 
             price_bar.open = float(row["Open"])
             price_bar.high = float(row["High"])

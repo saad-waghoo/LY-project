@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 from finsent.app.analysis.market_impact import align_news_with_prices, build_daily_impact_summary
 from finsent.app.database.base import SessionLocal, init_db
 from finsent.app.database.repository import NewsRepository, PriceRepository
+from finsent.app.services.kaggle_data import load_company_universe
 
 if TYPE_CHECKING:
     from finsent.app.services.pipeline import FinSentPipeline
@@ -72,10 +73,25 @@ def get_pipeline() -> FinSentPipeline:
 
 
 def get_ticker_options() -> list[dict[str, str]]:
-    return [
-        {"label": f'{item["ticker"]}  |  {item["name"]}', "value": item["ticker"]}
-        for item in WATCHLIST
-    ]
+    companies = load_company_universe()
+    if companies:
+        return [
+            {
+                "label": f"{company.ticker}  |  {company.name}",
+                "value": company.ticker,
+            }
+            for company in companies
+        ]
+
+    return [{"label": f'{item["ticker"]}  |  {item["name"]}', "value": item["ticker"]} for item in WATCHLIST]
+
+
+def get_company_name(ticker: str) -> str:
+    normalized = ticker.upper()
+    for company in load_company_universe():
+        if company.ticker == normalized:
+            return company.name
+    return WATCHLIST_MAP.get(ticker.upper(), {}).get("name", ticker.upper())
 
 
 def build_dashboard_state(
@@ -87,14 +103,12 @@ def build_dashboard_state(
 ) -> DashboardState:
     selected = normalize_tickers([focus_ticker, *(compare_tickers or [])])
     news_df, price_df = load_live_data(selected)
-    demo_mode = news_df.empty and price_df.empty
-
-    if demo_mode:
-        demo_tickers = selected or [item["ticker"] for item in WATCHLIST[:4]]
-        news_df, price_df = generate_demo_data(demo_tickers)
-        data_status = "Demo mode active: visuals are using placeholder data because live pipeline data is missing."
-    else:
-        data_status = "Live mode active: dashboard is rendering stored pipeline data."
+    demo_mode = False
+    data_status = (
+        "Live mode active: dashboard is rendering stored pipeline data."
+        if not news_df.empty or not price_df.empty
+        else "No live data is stored yet for the selected ticker and window."
+    )
 
     news_df, price_df = filter_to_window(news_df, price_df, horizon, start_date, end_date)
     event_df = build_event_frame(news_df, price_df)
@@ -195,6 +209,7 @@ def filter_to_window(
     if start_date or end_date:
         start_ts = pd.to_datetime(start_date) if start_date else None
         end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) if end_date else None
+        window_days = max(int(((end_ts or start_ts) - (start_ts or end_ts)).days), 1) if (start_ts is not None and end_ts is not None) else 30
     else:
         anchor = None
         if not news_df.empty:
@@ -202,8 +217,11 @@ def filter_to_window(
         elif not price_df.empty:
             anchor = price_df["timestamp"].max()
         lookback_days = HORIZON_DAYS.get(horizon, 7)
+        window_days = lookback_days
         start_ts = anchor - pd.Timedelta(days=lookback_days) if anchor is not None else None
         end_ts = anchor + pd.Timedelta(days=1) if anchor is not None else None
+
+    original_price_df = price_df.copy()
 
     if start_ts is not None and not news_df.empty:
         news_df = news_df[news_df["published_at"] >= start_ts]
@@ -213,6 +231,20 @@ def filter_to_window(
         price_df = price_df[price_df["timestamp"] >= start_ts]
     if end_ts is not None and not price_df.empty:
         price_df = price_df[price_df["timestamp"] <= end_ts]
+
+    if price_df.empty and not original_price_df.empty:
+        fallback_frames: list[pd.DataFrame] = []
+        for ticker in sorted(original_price_df["ticker"].dropna().unique()):
+            ticker_prices = original_price_df[original_price_df["ticker"] == ticker].copy()
+            if ticker_prices.empty:
+                continue
+            latest_timestamp = ticker_prices["timestamp"].max()
+            fallback_start = latest_timestamp - pd.Timedelta(days=window_days)
+            fallback_subset = ticker_prices[ticker_prices["timestamp"] >= fallback_start]
+            if not fallback_subset.empty:
+                fallback_frames.append(fallback_subset)
+        if fallback_frames:
+            price_df = pd.concat(fallback_frames, ignore_index=True)
 
     return news_df.copy(), price_df.copy()
 
@@ -401,7 +433,7 @@ def build_ai_explanation(focus_ticker: str, news_df: pd.DataFrame, compare_df: p
     if ticker_news.empty:
         return [
             f"{focus_ticker} has no stored headlines in the selected window.",
-            "Run the data pipeline for this ticker or use the dashboard in demo mode for a visual walkthrough.",
+            "Run the live pipeline for this ticker so the dashboard can plot real sentiment and price history.",
         ]
 
     avg_sentiment = float(ticker_news["sentiment_score"].mean())
@@ -418,10 +450,11 @@ def build_ai_explanation(focus_ticker: str, news_df: pd.DataFrame, compare_df: p
     if len(latest) > 1:
         explanation.append(f"Supporting context: {latest[1]}")
 
-    peer_rank = compare_df.sort_values("avg_sentiment", ascending=False).reset_index(drop=True)
-    if focus_ticker in peer_rank["ticker"].tolist():
-        rank = int(peer_rank.index[peer_rank["ticker"] == focus_ticker][0]) + 1
-        explanation.append(f"Peer position: ranked {rank} on sentiment across the compared tickers.")
+    if not compare_df.empty and "avg_sentiment" in compare_df.columns and "ticker" in compare_df.columns:
+        peer_rank = compare_df.sort_values("avg_sentiment", ascending=False).reset_index(drop=True)
+        if focus_ticker in peer_rank["ticker"].tolist():
+            rank = int(peer_rank.index[peer_rank["ticker"] == focus_ticker][0]) + 1
+            explanation.append(f"Peer position: ranked {rank} on sentiment across the compared tickers.")
     return explanation
 
 
@@ -526,36 +559,89 @@ def build_metric_cards(compare_df: pd.DataFrame, event_df: pd.DataFrame) -> list
 
 
 def build_sentiment_timeline(news_df: pd.DataFrame) -> go.Figure:
+    return build_sentiment_timeline_with_title(news_df, "Sentiment Timeline")
+
+
+def build_sentiment_timeline_with_title(news_df: pd.DataFrame, title: str) -> go.Figure:
     fig = go.Figure()
+    sparse_series = False
     if not news_df.empty:
         work = news_df.copy()
         work["day"] = work["published_at"].dt.floor("D")
         grouped = (
             work.groupby(["ticker", "day"], as_index=False)
-            .agg(sentiment=("sentiment_score", "mean"), confidence=("positive_score", "mean"))
+            .agg(
+                sentiment=("sentiment_score", "mean"),
+                confidence=("positive_score", "mean"),
+                headline_count=("title", "count"),
+            )
         )
         for ticker in sorted(grouped["ticker"].unique()):
             subset = grouped[grouped["ticker"] == ticker]
-            fig.add_trace(
-                go.Scatter(
-                    x=subset["day"],
-                    y=subset["sentiment"],
-                    mode="lines+markers",
-                    name=ticker,
-                    line={"width": 3},
+            if len(subset) <= 3:
+                sparse_series = True
+                fig.add_trace(
+                    go.Bar(
+                        x=subset["day"],
+                        y=subset["sentiment"],
+                        name=ticker,
+                        marker_color=np.where(
+                            subset["sentiment"] >= 0,
+                            PALETTE["bull"],
+                            PALETTE["bear"],
+                        ),
+                        opacity=0.8,
+                        customdata=subset[["headline_count"]],
+                        hovertemplate=(
+                            "<b>%{x|%d %b %Y}</b><br>"
+                            "Sentiment: %{y:.2f}<br>"
+                            "Headlines: %{customdata[0]}<extra>"
+                            + ticker
+                            + "</extra>"
+                        ),
+                    )
                 )
-            )
+            else:
+                fig.add_trace(
+                    go.Scatter(
+                        x=subset["day"],
+                        y=subset["sentiment"],
+                        mode="lines+markers",
+                        name=ticker,
+                        line={"width": 3},
+                        customdata=subset[["headline_count"]],
+                        hovertemplate=(
+                            "<b>%{x|%d %b %Y}</b><br>"
+                            "Sentiment: %{y:.2f}<br>"
+                            "Headlines: %{customdata[0]}<extra>"
+                            + ticker
+                            + "</extra>"
+                        ),
+                    )
+                )
 
     fig.update_layout(
-        title="Sentiment Timeline",
+        title=title,
         paper_bgcolor=PALETTE["paper"],
         plot_bgcolor=PALETTE["paper"],
         font={"color": PALETTE["ink"]},
         margin={"l": 32, "r": 24, "t": 56, "b": 28},
         legend={"orientation": "h", "y": 1.12},
+        barmode="group",
         xaxis={"title": "", "gridcolor": PALETTE["grid"]},
         yaxis={"title": "Sentiment Score", "gridcolor": PALETTE["grid"], "zerolinecolor": PALETTE["grid"]},
     )
+    if sparse_series:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=1,
+            y=1.16,
+            showarrow=False,
+            xanchor="right",
+            text="Sparse data shown as daily bars",
+            font={"size": 12, "color": PALETTE["muted"]},
+        )
     return fig
 
 
@@ -623,7 +709,7 @@ def build_impact_scatter(event_df: pd.DataFrame) -> go.Figure:
             )
 
     fig.update_layout(
-        title="News Impact Breakdown",
+        title="Sentiment vs Estimated Impact",
         paper_bgcolor=PALETTE["paper"],
         plot_bgcolor=PALETTE["paper"],
         font={"color": PALETTE["ink"]},
@@ -664,50 +750,56 @@ def build_sector_heatmap(sector_df: pd.DataFrame) -> go.Figure:
 def build_compare_chart(compare_df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if not compare_df.empty:
-        ordered = compare_df.sort_values("avg_sentiment", ascending=False)
+        ordered = compare_df.sort_values("pct_change", ascending=False)
         fig.add_trace(
             go.Bar(
                 x=ordered["ticker"],
                 y=ordered["avg_sentiment"],
-                name="Avg Sentiment",
-                marker_color=PALETTE["accent"],
+                name="Sentiment",
+                marker_color=PALETTE["bull"],
             )
         )
         fig.add_trace(
             go.Bar(
                 x=ordered["ticker"],
                 y=ordered["pct_change"],
-                name="Price Change %",
+                name="Return %",
                 marker_color=PALETTE["accent_2"],
             )
         )
         fig.add_trace(
             go.Scatter(
                 x=ordered["ticker"],
-                y=ordered["news_volume"],
-                name="News Volume",
+                y=ordered["avg_confidence"],
+                name="Confidence %",
                 mode="lines+markers",
                 line={"color": PALETTE["line"], "width": 3},
+                marker={"size": 10},
                 yaxis="y2",
             )
         )
 
     fig.update_layout(
-        title="Compare Stocks",
+        title="Signal Snapshot",
         barmode="group",
         paper_bgcolor=PALETTE["paper"],
         plot_bgcolor=PALETTE["paper"],
         font={"color": PALETTE["ink"]},
         margin={"l": 32, "r": 24, "t": 56, "b": 28},
         xaxis={"title": "", "gridcolor": PALETTE["grid"]},
-        yaxis={"title": "Sentiment / Return", "gridcolor": PALETTE["grid"]},
-        yaxis2={"title": "News Volume", "overlaying": "y", "side": "right", "showgrid": False},
+        yaxis={"title": "Sentiment / Return %", "gridcolor": PALETTE["grid"]},
+        yaxis2={"title": "Confidence %", "overlaying": "y", "side": "right", "showgrid": False, "range": [0, 100]},
         legend={"orientation": "h", "y": 1.12},
     )
     return fig
 
 
-def build_price_timeline(price_df: pd.DataFrame, focus_ticker: str | None = None, title: str = "Price Timeline") -> go.Figure:
+def build_price_timeline(
+    price_df: pd.DataFrame,
+    focus_ticker: str | None = None,
+    title: str = "Price Timeline",
+    normalize: bool = False,
+) -> go.Figure:
     fig = go.Figure()
     work = price_df.copy()
     if focus_ticker:
@@ -715,10 +807,15 @@ def build_price_timeline(price_df: pd.DataFrame, focus_ticker: str | None = None
     if not work.empty:
         for ticker in sorted(work["ticker"].unique()):
             subset = work[work["ticker"] == ticker]
+            y_values = subset["close"]
+            if normalize and not subset.empty:
+                start_close = float(subset["close"].iloc[0])
+                if start_close:
+                    y_values = (subset["close"] / start_close) * 100.0
             fig.add_trace(
                 go.Scatter(
                     x=subset["timestamp"],
-                    y=subset["close"],
+                    y=y_values,
                     mode="lines",
                     name=ticker,
                     line={"width": 3},
@@ -733,12 +830,12 @@ def build_price_timeline(price_df: pd.DataFrame, focus_ticker: str | None = None
         margin={"l": 32, "r": 24, "t": 56, "b": 28},
         legend={"orientation": "h", "y": 1.12},
         xaxis={"title": "", "gridcolor": PALETTE["grid"]},
-        yaxis={"title": "Close Price", "gridcolor": PALETTE["grid"]},
+        yaxis={"title": "Indexed Close (100 = start)" if normalize else "Close Price", "gridcolor": PALETTE["grid"]},
     )
     return fig
 
 
-def build_metric_grid(items: list[tuple[str, str, str]]) -> list[dbc.Col]:
+def build_metric_grid(items: list[tuple[str, str, str]], column_size: int = 3) -> list[dbc.Col]:
     return [
         dbc.Col(
             html.Div(
@@ -749,10 +846,36 @@ def build_metric_grid(items: list[tuple[str, str, str]]) -> list[dbc.Col]:
                 ],
                 className="metric-card",
             ),
-            md=3,
+            md=6,
+            lg=column_size,
         )
         for title, value, note in items
     ]
+
+
+def build_empty_figure(title: str, message: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        paper_bgcolor=PALETTE["paper"],
+        plot_bgcolor=PALETTE["paper"],
+        font={"color": PALETTE["ink"]},
+        margin={"l": 32, "r": 24, "t": 56, "b": 28},
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        annotations=[
+            {
+                "text": message,
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+                "showarrow": False,
+                "font": {"size": 14, "color": PALETTE["muted"]},
+            }
+        ],
+    )
+    return fig
 
 
 def build_summary_list(items: list[tuple[str, str]]) -> list[html.Div]:
@@ -774,17 +897,19 @@ def build_news_table(event_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFr
         work["confidence_pct"] = work["confidence_pct"].round(1)
         work["impact_pct"] = work["impact_pct"].round(2)
         work["published_at"] = pd.to_datetime(work["published_at"]).dt.strftime("%Y-%m-%d %H:%M")
+        work["source"] = work.get("source", "Unknown")
         work["explanation"] = np.where(
             work["sentiment_score"] > 0.2,
             "Positive catalyst cluster",
             np.where(work["sentiment_score"] < -0.2, "Negative catalyst cluster", "Mixed or neutral tone"),
         )
         return work[
-            ["published_at", "ticker", "title", "sentiment_label", "confidence_pct", "impact_pct", "explanation"]
+            ["published_at", "ticker", "source", "title", "sentiment_label", "confidence_pct", "impact_pct", "explanation"]
         ].rename(
             columns={
                 "published_at": "Time",
                 "ticker": "Ticker",
+                "source": "Source",
                 "title": "Headline",
                 "sentiment_label": "Sentiment",
                 "confidence_pct": "Confidence %",
@@ -794,23 +919,24 @@ def build_news_table(event_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFr
         )
 
     if news_df.empty:
-        return pd.DataFrame(columns=["Time", "Ticker", "Headline", "Sentiment", "Confidence %", "Impact %", "Explanation"])
+        return pd.DataFrame(columns=["Time", "Ticker", "Source", "Headline", "Sentiment", "Confidence %", "Impact %", "Explanation"])
 
     fallback = news_df.sort_values("published_at", ascending=False).copy()
     fallback["Time"] = pd.to_datetime(fallback["published_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    fallback["Source"] = fallback.get("source", "Unknown")
     fallback["Confidence %"] = (
         fallback[["positive_score", "negative_score", "neutral_score"]].max(axis=1).fillna(0.0) * 100.0
     ).round(1)
     fallback["Impact %"] = "n/a"
     fallback["Explanation"] = "Price linkage unavailable for this headline in the current window."
-    return fallback[["Time", "ticker", "title", "sentiment_label", "Confidence %", "Impact %", "Explanation"]].rename(
+    return fallback[["Time", "ticker", "Source", "title", "sentiment_label", "Confidence %", "Impact %", "Explanation"]].rename(
         columns={"ticker": "Ticker", "title": "Headline", "sentiment_label": "Sentiment"}
     )
 
 
 def build_alert_panel(alerts: list[dict[str, str]], demo_mode: bool) -> list[dbc.ListGroupItem]:
     if not alerts:
-        label = "Demo mode is active, but no alerts triggered." if demo_mode else "No watchlist alerts in the selected window."
+        label = "No watchlist alerts in the selected window."
         return [dbc.ListGroupItem(label)]
 
     return [
