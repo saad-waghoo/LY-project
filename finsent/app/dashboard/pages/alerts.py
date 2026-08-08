@@ -18,6 +18,7 @@ def layout() -> html.Div:
                 ],
                 className="section-shell page-header-shell mb-3",
             ),
+            html.Div(id="alerts-status-banner", className="mb-3"),
             dbc.Row(
                 [
                     dbc.Col(

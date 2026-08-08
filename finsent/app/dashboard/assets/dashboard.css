@@ -72,6 +72,11 @@ body {
   gap: 16px;
 }
 
+.landing-search-field {
+  display: grid;
+  gap: 8px;
+}
+
 .landing-search-dropdown {
   font-size: 1.02rem;
 }
@@ -365,6 +370,18 @@ body {
   position: relative;
   overflow: visible;
   z-index: 25;
+}
+
+.workspace-primary-control-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.4fr) minmax(320px, 1fr);
+  gap: 14px;
+  align-items: end;
+}
+
+.workspace-primary-control {
+  display: grid;
+  gap: 8px;
 }
 
 .workspace-disclosure-copy-wrap {
@@ -892,7 +909,8 @@ body {
   .top-nav,
   .hero-shell,
   .workspace-primary-row,
-  .workspace-filter-grid {
+  .workspace-filter-grid,
+  .workspace-primary-control-grid {
     grid-template-columns: 1fr;
   }
 

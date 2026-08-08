@@ -3,7 +3,7 @@ from __future__ import annotations
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from finsent.app.dashboard.view_model import get_ticker_options
+from finsent.app.dashboard.view_model import get_exchange_options, get_ticker_options
 
 
 ANALYSIS_NAV_ITEMS = [
@@ -58,29 +58,50 @@ def build_nav_links(pathname: str | None, analysis_ready: bool) -> list[dcc.Link
 
 def build_workspace_bar(
     focus_ticker: str,
+    exchange_filter: str,
     compare_tickers: list[str] | None,
     horizon: str,
     date_window: str,
     alert_threshold: int,
 ) -> html.Div:
-    ticker_options = get_ticker_options()
+    exchange_options = get_exchange_options()
+    ticker_options = get_ticker_options(exchange_filter)
     return html.Div(
         [
             html.Div(
                 [
                     html.Div(
                         [
-                            html.Div("Selected Ticker", className="control-label"),
-                            dcc.Dropdown(
-                                id="global-focus-ticker",
-                                options=ticker_options,
-                                value=focus_ticker,
-                                clearable=False,
-                                searchable=True,
-                                className="finsent-dropdown workspace-dropdown",
+                            html.Div(
+                                [
+                                    html.Div("Selected Exchange", className="control-label"),
+                                    dcc.Dropdown(
+                                        id="global-exchange-filter",
+                                        options=exchange_options,
+                                        value=exchange_filter,
+                                        clearable=False,
+                                        searchable=False,
+                                        className="finsent-dropdown workspace-dropdown",
+                                    ),
+                                ],
+                                className="workspace-primary-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div("Selected Ticker", className="control-label"),
+                                    dcc.Dropdown(
+                                        id="global-focus-ticker",
+                                        options=ticker_options,
+                                        value=focus_ticker,
+                                        clearable=False,
+                                        searchable=True,
+                                        className="finsent-dropdown workspace-dropdown",
+                                    ),
+                                ],
+                                className="workspace-primary-control",
                             ),
                         ],
-                        className="workspace-primary-block",
+                        className="workspace-primary-block workspace-primary-control-grid",
                     ),
                     html.Div(
                         [
@@ -126,7 +147,7 @@ def build_workspace_bar(
                                                     {"label": "Last 7 Days", "value": "7d"},
                                                     {"label": "Last 30 Days", "value": "30d"},
                                                     {"label": "Last 90 Days", "value": "90d"},
-                                                    {"label": "All Stored Data", "value": "all"},
+                                                    {"label": "All Live Data", "value": "all"},
                                                 ],
                                                 value=date_window,
                                                 clearable=False,
@@ -204,6 +225,7 @@ def build_workspace_bar(
 
 
 def build_landing_search(default_ticker: str) -> html.Div:
+    default_exchange = "US"
     return html.Div(
         [
             html.Div(
@@ -219,14 +241,33 @@ def build_landing_search(default_ticker: str) -> html.Div:
             ),
             html.Div(
                 [
-                    html.Div("Search Company / Ticker", className="control-label"),
-                    dcc.Dropdown(
-                        id="landing-ticker-search",
-                        options=get_ticker_options(),
-                        value=default_ticker,
-                        clearable=False,
-                        searchable=True,
-                        className="finsent-dropdown landing-search-dropdown",
+                    html.Div(
+                        [
+                            html.Div("Select Exchange", className="control-label"),
+                            dcc.Dropdown(
+                                id="landing-exchange-filter",
+                                options=get_exchange_options(),
+                                value=default_exchange,
+                                clearable=False,
+                                searchable=False,
+                                className="finsent-dropdown landing-search-dropdown",
+                            ),
+                        ],
+                        className="landing-search-field",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Search Company / Ticker", className="control-label"),
+                            dcc.Dropdown(
+                                id="landing-ticker-search",
+                                options=get_ticker_options(default_exchange),
+                                value=default_ticker,
+                                clearable=False,
+                                searchable=True,
+                                className="finsent-dropdown landing-search-dropdown",
+                            ),
+                        ],
+                        className="landing-search-field",
                     ),
                     dbc.Button("Load Analysis", id="landing-search-button", className="landing-search-button"),
                 ],
@@ -240,7 +281,7 @@ def build_landing_search(default_ticker: str) -> html.Div:
 
 def build_footer() -> html.Div:
     return html.Div(
-        "FinBERT | Financial PhraseBank | Sentiment-Price Analytics | Plotly Dash",
+        "Financial News | Market Signals | Plotly Dash",
         className="footer-strip",
     )
 

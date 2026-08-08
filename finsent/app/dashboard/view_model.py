@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from functools import lru_cache
-from hashlib import md5
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,28 +12,27 @@ from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 
 from finsent.app.analysis.market_impact import align_news_with_prices, build_daily_impact_summary
+from finsent.app.config.settings import settings
 from finsent.app.database.base import SessionLocal, init_db
-from finsent.app.database.repository import NewsRepository, PriceRepository
-from finsent.app.services.kaggle_data import load_company_universe
+from finsent.app.database.repository import (
+    NewsRepository,
+    PriceRepository,
+    QuoteSnapshotRepository,
+    SignalSnapshotRepository,
+)
+from finsent.app.models.schemas import MarketSignalSnapshot
+from finsent.app.services.intelligence_service import intelligence_service
+from finsent.app.services.symbol_registry import SymbolRecord, registry
 
 if TYPE_CHECKING:
     from finsent.app.services.pipeline import FinSentPipeline
 
 
-WATCHLIST = [
-    {"ticker": "AAPL", "name": "Apple", "sector": "Technology"},
-    {"ticker": "AMZN", "name": "Amazon", "sector": "Consumer"},
-    {"ticker": "MSFT", "name": "Microsoft", "sector": "Technology"},
-    {"ticker": "NVDA", "name": "NVIDIA", "sector": "Technology"},
-    {"ticker": "TSLA", "name": "Tesla", "sector": "Consumer"},
-    {"ticker": "JPM", "name": "JPMorgan", "sector": "Finance"},
-    {"ticker": "GS", "name": "Goldman Sachs", "sector": "Finance"},
-    {"ticker": "XOM", "name": "ExxonMobil", "sector": "Energy"},
-    {"ticker": "CVX", "name": "Chevron", "sector": "Energy"},
-    {"ticker": "PFE", "name": "Pfizer", "sector": "Healthcare"},
+EXCHANGE_OPTIONS = [
+    {"label": "US Markets", "value": "US"},
+    {"label": "NSE India", "value": "NSE"},
+    {"label": "BSE India", "value": "BSE"},
 ]
-
-WATCHLIST_MAP = {item["ticker"]: item for item in WATCHLIST}
 HORIZON_DAYS = {"short": 3, "medium": 7, "long": 30}
 PALETTE = {
     "bg": "#07111f",
@@ -52,6 +48,44 @@ PALETTE = {
     "grid": "#22314e",
 }
 
+NEWS_COLUMNS = [
+    "id",
+    "ticker",
+    "exchange",
+    "source",
+    "provider",
+    "title",
+    "summary",
+    "url",
+    "published_at",
+    "ingested_at",
+    "dedupe_hash",
+    "relevance_score",
+    "sentiment_label",
+    "sentiment_score",
+    "model_label",
+    "model_confidence",
+    "text_score",
+    "signal_confidence",
+    "positive_score",
+    "negative_score",
+    "neutral_score",
+    "bid_ask_spread",
+    "spread_pct",
+    "volume_ratio",
+    "buy_sell_ratio",
+    "buy_pressure",
+    "market_signal",
+    "relevant",
+    "impact_strength",
+    "time_horizon",
+    "catalyst_tag",
+    "short_reason",
+    "analysis_provider",
+    "parse_status",
+]
+PRICE_COLUMNS = ["ticker", "timestamp", "open", "high", "low", "close", "volume"]
+
 
 @dataclass(slots=True)
 class DashboardState:
@@ -61,70 +95,241 @@ class DashboardState:
     daily_summary_df: pd.DataFrame
     compare_df: pd.DataFrame
     sector_df: pd.DataFrame
+    snapshot_map: dict[str, MarketSignalSnapshot]
+    quote_meta_map: dict[str, dict[str, object]]
+    signal_meta_map: dict[str, dict[str, object]]
     demo_mode: bool
     data_status: str
 
 
-@lru_cache(maxsize=1)
 def get_pipeline() -> FinSentPipeline:
     from finsent.app.services.pipeline import FinSentPipeline
 
     return FinSentPipeline()
 
 
-def get_ticker_options() -> list[dict[str, str]]:
-    companies = load_company_universe()
-    if companies:
-        return [
-            {
-                "label": f"{company.ticker}  |  {company.name}",
-                "value": company.ticker,
-            }
-            for company in companies
-        ]
+def get_exchange_options() -> list[dict[str, str]]:
+    return EXCHANGE_OPTIONS
 
-    return [{"label": f'{item["ticker"]}  |  {item["name"]}', "value": item["ticker"]} for item in WATCHLIST]
+
+def _symbol_from_value(raw_value: str | None, exchange_hint: str | None = None) -> SymbolRecord | None:
+    if not raw_value:
+        return None
+    symbol = registry.resolve_any(raw_value)
+    if symbol is not None:
+        return symbol
+    if exchange_hint:
+        return registry.get(exchange_hint, raw_value)
+    return None
+
+
+def _storage_ticker(symbol: SymbolRecord) -> str:
+    return intelligence_service.storage_ticker(symbol)
+
+
+def _symbol_key(symbol: SymbolRecord) -> str:
+    return symbol.provider_symbol
+
+
+def _format_sentiment_score(label: str | None, confidence: float | None) -> float:
+    direction = 1.0 if label == "bullish" else -1.0 if label == "bearish" else 0.0
+    return direction * float(confidence or 0.0)
+
+
+def _normalize_news_sentiment(news_df: pd.DataFrame) -> pd.DataFrame:
+    if news_df.empty:
+        return news_df
+    work = news_df.copy()
+    if "sentiment_label" in work.columns:
+        mapped_label = (
+            work["sentiment_label"]
+            .astype(str)
+            .str.lower()
+            .replace({"positive": "bullish", "negative": "bearish", "neutral": "neutral"})
+        )
+        work["sentiment_label"] = mapped_label
+    if "sentiment_score" not in work.columns:
+        work["sentiment_score"] = 0.0
+    score_series = pd.to_numeric(work["sentiment_score"], errors="coerce").fillna(0.0)
+    if (score_series.abs() < 1e-9).all() and "sentiment_label" in work.columns:
+        confidence = pd.to_numeric(work.get("model_confidence"), errors="coerce").fillna(
+            pd.to_numeric(work.get("signal_confidence"), errors="coerce").fillna(0.0)
+        )
+        work["sentiment_score"] = [
+            _format_sentiment_score(label, conf) for label, conf in zip(work["sentiment_label"], confidence, strict=False)
+        ]
+    return work
+
+
+def filter_symbols_for_exchange(exchange_filter: str | None = None) -> list[SymbolRecord]:
+    exchange = (exchange_filter or "US").upper().strip()
+    return registry.list_symbols(exchange)
+
+
+def get_ticker_options(exchange_filter: str | None = None) -> list[dict[str, str]]:
+    return [
+        {"label": symbol.ui_label, "value": symbol.provider_symbol}
+        for symbol in filter_symbols_for_exchange(exchange_filter)
+    ]
+
+
+def get_default_ticker_for_exchange(exchange_filter: str | None = None) -> str:
+    symbols = filter_symbols_for_exchange(exchange_filter)
+    return symbols[0].provider_symbol if symbols else "AAPL"
+
+
+def get_exchange_for_ticker(ticker: str) -> str:
+    symbol = _symbol_from_value(ticker)
+    if symbol is not None:
+        return symbol.exchange
+    normalized = (ticker or "").upper().strip()
+    if normalized.endswith(".NS"):
+        return "NSE"
+    if normalized.endswith(".BO"):
+        return "BSE"
+    if ":" in normalized:
+        return normalized.split(":", maxsplit=1)[0]
+    return "US"
 
 
 def get_company_name(ticker: str) -> str:
-    normalized = ticker.upper()
-    for company in load_company_universe():
-        if company.ticker == normalized:
-            return company.name
-    return WATCHLIST_MAP.get(ticker.upper(), {}).get("name", ticker.upper())
+    symbol = _symbol_from_value(ticker)
+    if symbol is not None:
+        return symbol.display_name
+    return (ticker or "").upper()
 
 
-def build_dashboard_state(
-    focus_ticker: str,
-    compare_tickers: list[str] | None,
-    horizon: str,
-    start_date: str | None,
-    end_date: str | None,
-) -> DashboardState:
-    selected = normalize_tickers([focus_ticker, *(compare_tickers or [])])
-    news_df, price_df = load_live_data(selected)
-    demo_mode = False
-    data_status = (
-        "Live mode active: dashboard is rendering stored pipeline data."
-        if not news_df.empty or not price_df.empty
-        else "No live data is stored yet for the selected ticker and window."
-    )
+def get_price_status_note(ticker: str, has_price: bool, quote_meta: dict[str, object] | None = None) -> str:
+    if quote_meta:
+        source = quote_meta.get("provider") or "market feed"
+        freshness = quote_meta.get("freshness_seconds")
+        quality = str(quote_meta.get("quality_status") or "unavailable")
+        age_note = (
+            f"Last market update {int(float(freshness))}s ago"
+            if freshness is not None and pd.notna(freshness)
+            else "Freshness unavailable"
+        )
+        if quality == "live":
+            return f"Live quote from {source} • {age_note}"
+        if quality == "delayed":
+            return f"Delayed quote from {source} • {age_note}"
+        if quality == "stale":
+            return f"Stale cached quote from {source} • {age_note}"
+        return f"Quote unavailable from {source}"
+    if has_price:
+        return "Latest stored market close"
+    return f"No market quote is currently available for {get_exchange_for_ticker(ticker)}"
 
-    news_df, price_df = filter_to_window(news_df, price_df, horizon, start_date, end_date)
-    event_df = build_event_frame(news_df, price_df)
-    daily_summary_df = build_grouped_daily_summary(event_df)
-    compare_df = build_compare_frame(news_df, price_df, event_df)
-    sector_df = build_sector_frame(compare_df)
 
-    return DashboardState(
-        news_df=news_df,
-        price_df=price_df,
-        event_df=event_df,
-        daily_summary_df=daily_summary_df,
-        compare_df=compare_df,
-        sector_df=sector_df,
-        demo_mode=demo_mode,
-        data_status=data_status,
+def format_age_from_timestamp(value: object) -> str:
+    if value is None or (isinstance(value, float) and not pd.notna(value)):
+        return "n/a"
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return "n/a"
+    if pd.isna(ts):
+        return "n/a"
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    delta_seconds = max(int((now - ts.tz_localize(None) if getattr(ts, "tzinfo", None) is not None else now - ts).total_seconds()), 0)
+    if delta_seconds < 60:
+        return f"{delta_seconds}s"
+    if delta_seconds < 3600:
+        return f"{delta_seconds // 60}m"
+    if delta_seconds < 86400:
+        return f"{delta_seconds // 3600}h"
+    return f"{delta_seconds // 86400}d"
+
+
+def latest_recent_close(price_df: pd.DataFrame, max_age_minutes: int | None = None) -> float | None:
+    if price_df.empty or "timestamp" not in price_df.columns or "close" not in price_df.columns:
+        return None
+    timestamps = pd.to_datetime(price_df["timestamp"], errors="coerce")
+    if timestamps.dropna().empty:
+        return None
+    latest_idx = timestamps.idxmax()
+    latest_ts = timestamps.loc[latest_idx]
+    cutoff_minutes = max_age_minutes if max_age_minutes is not None else settings.live_price_max_age_minutes
+    age = pd.Timestamp.utcnow().tz_localize(None) - latest_ts
+    if age > pd.Timedelta(minutes=cutoff_minutes):
+        return None
+    try:
+        value = float(price_df.loc[latest_idx, "close"])
+    except (TypeError, ValueError):
+        return None
+    return value if pd.notna(value) else None
+
+
+def _derive_news_quality(news_df: pd.DataFrame) -> str:
+    if news_df.empty:
+        return "unavailable"
+    providers = {str(provider).strip().lower() for provider in news_df.get("provider", pd.Series(dtype=str)).dropna().tolist()}
+    parse_statuses = {str(status).strip().lower() for status in news_df.get("parse_status", pd.Series(dtype=str)).dropna().tolist()}
+    if any(status != "ok" for status in parse_statuses):
+        return "inferred"
+    if providers and providers.issubset({"polygon", "marketaux"}):
+        return "provider-grade"
+    if providers:
+        return "fallback-quality"
+    return "unavailable"
+
+
+def _derive_bars_status(focus_ticker: str, price_df: pd.DataFrame, quote_meta: dict[str, object]) -> str:
+    ticker_prices = price_df[price_df["ticker"] == focus_ticker] if not price_df.empty else pd.DataFrame()
+    if not ticker_prices.empty:
+        return "available"
+    quality = str(quote_meta.get("quality_status") or "unavailable")
+    if quality in {"live", "delayed", "stale"}:
+        return "unavailable"
+    return "unavailable"
+
+
+def build_focus_status_banner(focus_ticker: str, state: DashboardState) -> html.Div:
+    compare_row = state.compare_df[state.compare_df["ticker"] == focus_ticker]
+    ticker_news = state.news_df[state.news_df["ticker"] == focus_ticker].copy()
+    quote_meta = state.quote_meta_map.get(focus_ticker, {})
+    signal_meta = state.signal_meta_map.get(focus_ticker, {})
+
+    price_source = str(quote_meta.get("provider") or "unavailable")
+    price_quality = str(quote_meta.get("quality_status") or "unavailable")
+    news_providers = sorted({str(value) for value in ticker_news.get("provider", pd.Series(dtype=str)).dropna().unique().tolist()})
+    news_sources = sorted({str(value) for value in ticker_news.get("source", pd.Series(dtype=str)).dropna().unique().tolist()})
+    news_provider_label = ", ".join(news_providers[:2]) if news_providers else "unavailable"
+    news_source_label = ", ".join(news_sources[:2]) if news_sources else "unavailable"
+    latest_news_at = ticker_news["published_at"].max() if not ticker_news.empty else None
+    latest_quote_at = quote_meta.get("market_timestamp") or quote_meta.get("ingested_at")
+    freshness_age = format_age_from_timestamp(latest_news_at or latest_quote_at)
+    mode = str(signal_meta.get("mode") or compare_row["mode"].iloc[0] if not compare_row.empty else "Unavailable")
+    news_quality = _derive_news_quality(ticker_news)
+    bars_status = _derive_bars_status(focus_ticker, state.price_df, quote_meta)
+    if mode == "Market + News" and price_quality == "live" and news_quality == "provider-grade":
+        overall_quality = "live"
+    elif mode == "Unavailable":
+        overall_quality = "unavailable"
+    elif mode == "Market-only fallback" and price_quality in {"live", "delayed", "stale"}:
+        overall_quality = "inferred"
+    elif news_quality in {"fallback-quality", "unavailable", "inferred"}:
+        overall_quality = news_quality
+    else:
+        overall_quality = price_quality
+
+    pills = [
+        html.Div(f"Price source: {price_source}", className="status-pill"),
+        html.Div(f"Bars status: {bars_status}", className="status-pill"),
+        html.Div(f"News provider: {news_provider_label}", className="status-pill"),
+        html.Div(f"News tier: {news_quality}", className="status-pill"),
+        html.Div(f"News source: {news_source_label}", className="status-pill"),
+        html.Div(f"Freshness age: {freshness_age}", className="status-pill"),
+        html.Div(f"Mode: {mode}", className="status-pill"),
+        html.Div(f"Quality: {overall_quality}", className="status-pill"),
+    ]
+    return html.Div(
+        [
+            html.Div("Runtime Status", className="status-value"),
+            html.Div(state.data_status, className="status-copy"),
+            html.Div(pills, className="badge-row"),
+        ],
+        className="status-banner",
     )
 
 
@@ -139,61 +344,318 @@ def normalize_tickers(raw_tickers: list[str | None]) -> list[str]:
     return values
 
 
-def load_live_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def empty_news_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=NEWS_COLUMNS)
+
+
+def empty_price_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=PRICE_COLUMNS)
+
+
+def confidence_series(news_df: pd.DataFrame) -> pd.Series:
+    if "signal_confidence" in news_df.columns:
+        return pd.to_numeric(news_df["signal_confidence"], errors="coerce").fillna(
+            pd.to_numeric(news_df.get("model_confidence"), errors="coerce").fillna(0.0)
+        )
+    if "model_confidence" in news_df.columns:
+        return pd.to_numeric(news_df["model_confidence"], errors="coerce").fillna(0.0)
+    if {"positive_score", "negative_score", "neutral_score"}.issubset(news_df.columns):
+        return news_df[["positive_score", "negative_score", "neutral_score"]].max(axis=1).fillna(0.0)
+    return pd.Series(0.0, index=news_df.index, dtype=float)
+
+
+def spread_pct_series(news_df: pd.DataFrame) -> pd.Series:
+    if "spread_pct" in news_df.columns:
+        return pd.to_numeric(news_df["spread_pct"], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=news_df.index, dtype=float)
+
+
+def volume_ratio_series(news_df: pd.DataFrame) -> pd.Series:
+    if "volume_ratio" in news_df.columns:
+        return pd.to_numeric(news_df["volume_ratio"], errors="coerce").fillna(1.0)
+    return pd.Series(1.0, index=news_df.index, dtype=float)
+
+
+def buy_sell_ratio_series(news_df: pd.DataFrame) -> pd.Series:
+    if "buy_sell_ratio" in news_df.columns:
+        return pd.to_numeric(news_df["buy_sell_ratio"], errors="coerce").fillna(1.0)
+    return pd.Series(1.0, index=news_df.index, dtype=float)
+
+
+def market_signal_series(news_df: pd.DataFrame) -> pd.Series:
+    if "market_signal" in news_df.columns:
+        return pd.to_numeric(news_df["market_signal"], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=news_df.index, dtype=float)
+
+
+def label_for_signal(score: float) -> str:
+    if score > 0.15:
+        return "positive"
+    if score < -0.15:
+        return "negative"
+    return "neutral"
+
+
+def filter_to_fresh_news(news_df: pd.DataFrame) -> pd.DataFrame:
+    if news_df.empty:
+        return news_df
+    work = news_df.copy()
+    work["published_at"] = pd.to_datetime(work["published_at"], errors="coerce")
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(minutes=settings.live_news_max_age_minutes)
+    fresh = work[work["published_at"] >= cutoff].copy()
+    return fresh if not fresh.empty else empty_news_frame()
+
+
+def expand_sparse_news_window(
+    all_news_df: pd.DataFrame,
+    filtered_news_df: pd.DataFrame,
+    tickers: list[str],
+    horizon: str,
+    minimum_rows: int = 5,
+    maximum_rows: int = 10,
+) -> pd.DataFrame:
+    if all_news_df.empty:
+        return filtered_news_df
+
+    work = all_news_df.copy()
+    work["published_at"] = pd.to_datetime(work["published_at"], errors="coerce")
+    work = work.dropna(subset=["published_at"])
+    if work.empty:
+        return filtered_news_df
+
+    result = filtered_news_df.copy()
+    anchor = work["published_at"].max()
+    fallback_days = max(HORIZON_DAYS.get(horizon, 7), 4)
+    recent_pool = work[work["published_at"] >= anchor - pd.Timedelta(days=fallback_days)].copy()
+
+    for ticker in tickers:
+        current_rows = result[result["ticker"] == ticker].copy()
+        if len(current_rows) >= minimum_rows:
+            continue
+
+        ticker_pool = recent_pool[recent_pool["ticker"] == ticker].sort_values("published_at", ascending=False).copy()
+        if ticker_pool.empty:
+            continue
+
+        existing_hashes = set(current_rows.get("dedupe_hash", pd.Series(dtype=str)).dropna().astype(str).tolist())
+        supplement = ticker_pool[
+            ~ticker_pool.get("dedupe_hash", pd.Series(dtype=str)).astype(str).isin(existing_hashes)
+        ].head(max(maximum_rows - len(current_rows), 0))
+
+        if not supplement.empty:
+            result = pd.concat([result, supplement], ignore_index=True)
+
+    if result.empty:
+        return result
+    return (
+        result.sort_values("published_at", ascending=True)
+        .drop_duplicates(subset=["ticker", "dedupe_hash"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def needs_live_refresh(ticker: str, max_age_minutes: int | None = None) -> bool:
+    symbol = _symbol_from_value(ticker)
+    if symbol is None:
+        return True
+    max_age_seconds = float((max_age_minutes or settings.live_refresh_max_age_minutes) * 60)
+    init_db()
+    with SessionLocal() as session:
+        quote_row = QuoteSnapshotRepository(session).latest_for_symbol(symbol.ticker, symbol.exchange)
+        news_df = NewsRepository(session).list_news_df(symbol.ticker, symbol.exchange)
+        price_df = PriceRepository(session).list_price_df(_storage_ticker(symbol))
+    if quote_row is None:
+        return True
+    if quote_row.freshness_seconds is None or float(quote_row.freshness_seconds) > max_age_seconds:
+        return True
+    if price_df.empty:
+        return True
+    latest_bar = pd.to_datetime(price_df["timestamp"], errors="coerce").dropna()
+    if latest_bar.empty:
+        return True
+    if (pd.Timestamp.utcnow().tz_localize(None) - latest_bar.max()) > pd.Timedelta(minutes=settings.live_price_max_age_minutes):
+        return True
+    if news_df.empty:
+        return True
+    latest_news = pd.to_datetime(news_df["published_at"], errors="coerce").dropna()
+    if latest_news.empty:
+        return True
+    return (pd.Timestamp.utcnow().tz_localize(None) - latest_news.max()) > pd.Timedelta(minutes=max_age_minutes or settings.live_refresh_max_age_minutes)
+
+
+def ensure_live_data(
+    tickers: list[str],
+    force: bool = False,
+    limit: int | None = None,
+) -> None:
+    for ticker in normalize_tickers(tickers):
+        symbol = _symbol_from_value(ticker)
+        if symbol is None:
+            continue
+        if not force and not needs_live_refresh(symbol.provider_symbol):
+            continue
+        try:
+            intelligence_service.run(symbol)
+        except Exception:
+            continue
+
+
+def load_live_data(
+    tickers: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     init_db()
     news_frames: list[pd.DataFrame] = []
     price_frames: list[pd.DataFrame] = []
+    quote_meta_map: dict[str, dict[str, object]] = {}
+    signal_meta_map: dict[str, dict[str, object]] = {}
 
     with SessionLocal() as session:
         news_repo = NewsRepository(session)
         price_repo = PriceRepository(session)
+        quote_repo = QuoteSnapshotRepository(session)
+        signal_repo = SignalSnapshotRepository(session)
+
         for ticker in tickers:
-            news_df = news_repo.list_news_df(ticker=ticker)
-            price_df = price_repo.list_price_df(ticker=ticker)
+            symbol = _symbol_from_value(ticker)
+            if symbol is None:
+                continue
+            key = _symbol_key(symbol)
+
+            news_df = news_repo.list_news_df(ticker=symbol.ticker, exchange=symbol.exchange)
             if not news_df.empty:
+                news_df = _normalize_news_sentiment(news_df)
+                news_df["ticker"] = key
+                news_df["exchange"] = symbol.exchange
                 news_frames.append(news_df)
+
+            price_df = price_repo.list_price_df(_storage_ticker(symbol))
             if not price_df.empty:
+                price_df["ticker"] = key
                 price_frames.append(price_df)
 
-    news_df = pd.concat(news_frames, ignore_index=True) if news_frames else pd.DataFrame()
-    price_df = pd.concat(price_frames, ignore_index=True) if price_frames else pd.DataFrame()
+            quote_row = quote_repo.latest_for_symbol(symbol.ticker, symbol.exchange)
+            if quote_row is not None:
+                quote_meta_map[key] = {
+                    "provider": quote_row.provider,
+                    "current_price": quote_row.current_price,
+                    "currency": quote_row.currency,
+                    "bid": quote_row.bid,
+                    "ask": quote_row.ask,
+                    "spread_absolute": quote_row.spread_absolute,
+                    "spread_percentage": quote_row.spread_percentage,
+                    "volume": quote_row.volume,
+                    "market_timestamp": quote_row.market_timestamp,
+                    "ingested_at": quote_row.ingested_at,
+                    "freshness_seconds": quote_row.freshness_seconds,
+                    "quality_status": quote_row.quality_status,
+                    "note": quote_row.note,
+                }
+
+            signal_row = signal_repo.latest_for_symbol(symbol.ticker, symbol.exchange)
+            if signal_row is not None:
+                signal_meta_map[key] = {
+                    "composite_score": signal_row.composite_score,
+                    "composite_label": signal_row.composite_label,
+                    "signal_confidence": signal_row.signal_confidence,
+                    "mode": signal_row.mode,
+                    "overall_sentiment": signal_row.overall_sentiment,
+                    "overall_confidence": signal_row.overall_confidence,
+                    "action_bias": signal_row.action_bias,
+                    "net_short_term_view": signal_row.net_short_term_view,
+                    "final_reason": signal_row.final_reason,
+                    "explanation_bullets": (signal_row.explanation_bullets or "").splitlines(),
+                    "analysis_provider": signal_row.analysis_provider,
+                    "quote_provider": signal_row.quote_provider,
+                    "ingested_at": signal_row.ingested_at,
+                }
+
+    news_df = pd.concat(news_frames, ignore_index=True) if news_frames else empty_news_frame()
+    price_df = pd.concat(price_frames, ignore_index=True) if price_frames else empty_price_frame()
 
     if not news_df.empty:
-        news_df["published_at"] = pd.to_datetime(news_df["published_at"])
+        news_df["published_at"] = pd.to_datetime(news_df["published_at"], errors="coerce")
     if not price_df.empty:
-        price_df["timestamp"] = pd.to_datetime(price_df["timestamp"])
-
-    return news_df, price_df
-
-
-def needs_live_refresh(ticker: str) -> bool:
-    init_db()
-    with SessionLocal() as session:
-        news_df = NewsRepository(session).list_news_df(ticker=ticker)
-        price_df = PriceRepository(session).list_price_df(ticker=ticker)
-
-    if news_df.empty or price_df.empty:
-        return True
-
-    latest_news = pd.to_datetime(news_df["published_at"]).max()
-    latest_price = pd.to_datetime(price_df["timestamp"]).max()
-    now = pd.Timestamp.now().tz_localize(None)
-    if (now - latest_news) > pd.Timedelta(hours=24):
-        return True
-    if (now - latest_price) > pd.Timedelta(hours=24):
-        return True
-    return False
+        price_df["timestamp"] = pd.to_datetime(price_df["timestamp"], errors="coerce")
+    return news_df, price_df, quote_meta_map, signal_meta_map
 
 
-def ensure_live_data(tickers: list[str]) -> None:
-    for ticker in normalize_tickers(tickers):
-        if not needs_live_refresh(ticker):
-            continue
-        try:
-            get_pipeline().run(ticker=ticker, limit=20)
-        except Exception:
-            # The dashboard can still fall back to stored/demo data if live fetch fails.
-            continue
+def build_snapshot_map(
+    tickers: list[str],
+    quote_meta_map: dict[str, dict[str, object]],
+    signal_meta_map: dict[str, dict[str, object]],
+) -> dict[str, MarketSignalSnapshot]:
+    snapshots: dict[str, MarketSignalSnapshot] = {}
+    for ticker in tickers:
+        quote_meta = quote_meta_map.get(ticker, {})
+        signal_meta = signal_meta_map.get(ticker, {})
+        bid = quote_meta.get("bid")
+        ask = quote_meta.get("ask")
+        spread_absolute = quote_meta.get("spread_absolute")
+        snapshots[ticker] = MarketSignalSnapshot(
+            bid=float(bid) if bid is not None else None,
+            ask=float(ask) if ask is not None else None,
+            bid_ask_spread=float(spread_absolute) if spread_absolute is not None else None,
+            spread_pct=float(quote_meta.get("spread_percentage") or 0.0),
+            volume_ratio=1.0,
+            buy_sell_ratio=max(0.1, 1.0 - min(float(quote_meta.get("spread_percentage") or 0.0) * 10.0, 0.5)),
+            buy_pressure=float(signal_meta.get("composite_score") or 0.0),
+            market_signal=float(signal_meta.get("composite_score") or 0.0),
+            last_price=float(quote_meta.get("current_price")) if quote_meta.get("current_price") is not None else None,
+            price_timestamp=quote_meta.get("market_timestamp"),
+        )
+    return snapshots
+
+
+def build_dashboard_state(
+    focus_ticker: str,
+    compare_tickers: list[str] | None,
+    horizon: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> DashboardState:
+    selected = normalize_tickers([focus_ticker, *(compare_tickers or [])])
+    all_news_df, price_df, quote_meta_map, signal_meta_map = load_live_data(selected)
+    fresh_news_df = filter_to_fresh_news(all_news_df)
+    widened_news_df = expand_sparse_news_window(all_news_df, fresh_news_df, selected, horizon)
+    snapshot_map = build_snapshot_map(selected, quote_meta_map, signal_meta_map)
+    news_df, price_df = filter_to_window(widened_news_df, price_df, horizon, start_date, end_date)
+    event_df = build_event_frame(news_df, price_df)
+    daily_summary_df = build_grouped_daily_summary(event_df)
+    compare_df = build_compare_frame(news_df, price_df, event_df, snapshot_map, quote_meta_map, signal_meta_map)
+    sector_df = build_sector_frame(compare_df)
+
+    focus_symbol = _symbol_from_value(focus_ticker)
+    focus_quote_meta = quote_meta_map.get(focus_ticker, {})
+    focus_bars_status = _derive_bars_status(focus_ticker, price_df, focus_quote_meta)
+    focus_news_quality = _derive_news_quality(news_df[news_df["ticker"] == focus_ticker]) if not news_df.empty else "unavailable"
+
+    if not compare_df.empty and any(compare_df["mode"] == "Market + News"):
+        data_status = "Market + News mode: live quotes and fresh analyzed headlines are active."
+    elif focus_symbol is not None and focus_symbol.exchange in {"NSE", "BSE"} and focus_quote_meta and focus_bars_status == "unavailable":
+        data_status = (
+            f"{focus_symbol.exchange} quote is live, but historical bars are unavailable for overlap analysis. "
+            f"News quality is {focus_news_quality}."
+        )
+    elif quote_meta_map:
+        data_status = "Market-only fallback: live quotes are available, but fresh relevant headlines are limited."
+    elif not news_df.empty:
+        data_status = "News-only fallback: recent headlines exist, but current market quotes are unavailable."
+    else:
+        data_status = "Unavailable: no fresh provider data is currently available for the selected workspace."
+
+    return DashboardState(
+        news_df=news_df,
+        price_df=price_df,
+        event_df=event_df,
+        daily_summary_df=daily_summary_df,
+        compare_df=compare_df,
+        sector_df=sector_df,
+        snapshot_map=snapshot_map,
+        quote_meta_map=quote_meta_map,
+        signal_meta_map=signal_meta_map,
+        demo_mode=False,
+        data_status=data_status,
+    )
 
 
 def filter_to_window(
@@ -209,7 +671,7 @@ def filter_to_window(
     if start_date or end_date:
         start_ts = pd.to_datetime(start_date) if start_date else None
         end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) if end_date else None
-        window_days = max(int(((end_ts or start_ts) - (start_ts or end_ts)).days), 1) if (start_ts is not None and end_ts is not None) else 30
+        window_days = 30
     else:
         anchor = None
         if not news_df.empty:
@@ -222,7 +684,6 @@ def filter_to_window(
         end_ts = anchor + pd.Timedelta(days=1) if anchor is not None else None
 
     original_price_df = price_df.copy()
-
     if start_ts is not None and not news_df.empty:
         news_df = news_df[news_df["published_at"] >= start_ts]
     if end_ts is not None and not news_df.empty:
@@ -245,14 +706,12 @@ def filter_to_window(
                 fallback_frames.append(fallback_subset)
         if fallback_frames:
             price_df = pd.concat(fallback_frames, ignore_index=True)
-
     return news_df.copy(), price_df.copy()
 
 
 def build_event_frame(news_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
     if news_df.empty or price_df.empty:
         return pd.DataFrame()
-
     events: list[pd.DataFrame] = []
     for ticker in sorted(news_df["ticker"].dropna().unique()):
         ticker_news = news_df[news_df["ticker"] == ticker]
@@ -261,9 +720,7 @@ def build_event_frame(news_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataF
             continue
         joined = align_news_with_prices(ticker_news, ticker_prices, return_window_minutes=60)
         if not joined.empty:
-            joined["confidence_pct"] = (
-                joined[["positive_score", "negative_score", "neutral_score"]].max(axis=1).fillna(0.0) * 100.0
-            )
+            joined["confidence_pct"] = confidence_series(joined) * 100.0
             joined["impact_pct"] = joined["forward_return"].fillna(0.0) * 100.0
             events.append(joined)
     return pd.concat(events, ignore_index=True) if events else pd.DataFrame()
@@ -272,7 +729,6 @@ def build_event_frame(news_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataF
 def build_grouped_daily_summary(event_df: pd.DataFrame) -> pd.DataFrame:
     if event_df.empty:
         return pd.DataFrame()
-
     frames: list[pd.DataFrame] = []
     for ticker in sorted(event_df["ticker"].dropna().unique()):
         ticker_df = event_df[event_df["ticker"] == ticker]
@@ -283,41 +739,83 @@ def build_grouped_daily_summary(event_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def build_compare_frame(news_df: pd.DataFrame, price_df: pd.DataFrame, event_df: pd.DataFrame) -> pd.DataFrame:
-    tickers = sorted(set(news_df.get("ticker", pd.Series(dtype=str)).dropna().tolist()) | set(price_df.get("ticker", pd.Series(dtype=str)).dropna().tolist()))
+def build_compare_frame(
+    news_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    event_df: pd.DataFrame,
+    snapshot_map: dict[str, MarketSignalSnapshot] | None = None,
+    quote_meta_map: dict[str, dict[str, object]] | None = None,
+    signal_meta_map: dict[str, dict[str, object]] | None = None,
+) -> pd.DataFrame:
+    tickers = sorted(
+        set(news_df.get("ticker", pd.Series(dtype=str)).dropna().tolist())
+        | set(price_df.get("ticker", pd.Series(dtype=str)).dropna().tolist())
+        | set((quote_meta_map or {}).keys())
+    )
     rows: list[dict[str, object]] = []
 
     for ticker in tickers:
+        symbol = _symbol_from_value(ticker)
         ticker_news = news_df[news_df["ticker"] == ticker]
         ticker_prices = price_df[price_df["ticker"] == ticker]
         ticker_events = event_df[event_df["ticker"] == ticker] if not event_df.empty else pd.DataFrame()
-        if ticker_prices.empty:
-            continue
+        snapshot = (snapshot_map or {}).get(ticker)
+        quote_meta = (quote_meta_map or {}).get(ticker, {})
+        signal_meta = (signal_meta_map or {}).get(ticker, {})
+        bars_status = _derive_bars_status(ticker, price_df, quote_meta)
+        news_quality = _derive_news_quality(ticker_news)
 
-        first_close = float(ticker_prices["close"].iloc[0])
-        last_close = float(ticker_prices["close"].iloc[-1])
-        day_change_pct = ((last_close - first_close) / first_close) * 100 if first_close else 0.0
-        avg_sentiment = float(ticker_news["sentiment_score"].mean()) if not ticker_news.empty else 0.0
-        avg_confidence = (
-            float(ticker_news[["positive_score", "negative_score", "neutral_score"]].max(axis=1).mean() * 100.0)
-            if not ticker_news.empty
-            else 0.0
+        recent_close = latest_recent_close(ticker_prices)
+        current_price = (
+            float(quote_meta.get("current_price"))
+            if quote_meta.get("current_price") is not None
+            else recent_close
+            if recent_close is not None
+            else np.nan
         )
+        first_close = float(ticker_prices["close"].iloc[0]) if not ticker_prices.empty else np.nan
+        last_close = float(ticker_prices["close"].iloc[-1]) if not ticker_prices.empty else current_price
+        pct_change = ((last_close - first_close) / first_close) * 100.0 if pd.notna(first_close) and first_close else 0.0
+
+        if not ticker_news.empty:
+            avg_sentiment = float(ticker_news["sentiment_score"].mean())
+            avg_confidence = float(confidence_series(ticker_news).mean() * 100.0)
+            news_volume = int(len(ticker_news))
+        else:
+            avg_sentiment = float(signal_meta.get("composite_score") or snapshot.market_signal if snapshot is not None else 0.0)
+            raw_conf = signal_meta.get("signal_confidence")
+            avg_confidence = float(raw_conf) * 100.0 if raw_conf is not None else np.nan
+            news_volume = 0
+
         rows.append(
             {
                 "ticker": ticker,
-                "name": WATCHLIST_MAP.get(ticker, {}).get("name", ticker),
-                "sector": WATCHLIST_MAP.get(ticker, {}).get("sector", "Other"),
-                "last_close": last_close,
-                "pct_change": day_change_pct,
-                "news_volume": int(len(ticker_news)),
+                "name": symbol.display_name if symbol is not None else ticker,
+                "sector": symbol.sector if symbol is not None else "Other",
+                "exchange": symbol.exchange if symbol is not None else get_exchange_for_ticker(ticker),
+                "currency": quote_meta.get("currency") or ("USD" if (symbol and symbol.exchange == "US") else "INR"),
+                "last_close": current_price,
+                "pct_change": pct_change,
+                "news_volume": news_volume,
                 "avg_sentiment": avg_sentiment,
                 "avg_confidence": avg_confidence,
                 "avg_impact_pct": float(ticker_events["impact_pct"].mean()) if not ticker_events.empty else 0.0,
-                "volume": float(ticker_prices["volume"].iloc[-1]) if "volume" in ticker_prices else 0.0,
+                "avg_spread_pct": float((quote_meta.get("spread_percentage") or 0.0) * 100.0),
+                "avg_volume_ratio": float(volume_ratio_series(ticker_news).mean()) if not ticker_news.empty else 1.0,
+                "avg_buy_sell_ratio": float(buy_sell_ratio_series(ticker_news).mean()) if not ticker_news.empty else float(snapshot.buy_sell_ratio if snapshot is not None else 1.0),
+                "avg_market_signal": float(signal_meta.get("composite_score") or snapshot.market_signal if snapshot is not None else 0.0),
+                "volume": float(quote_meta.get("volume") or (ticker_prices["volume"].iloc[-1] if not ticker_prices.empty else 0.0)),
+                "quote_provider": quote_meta.get("provider") or "unavailable",
+                "quote_quality": quote_meta.get("quality_status") or "unavailable",
+                "bars_status": bars_status,
+                "news_quality": news_quality,
+                "freshness_seconds": quote_meta.get("freshness_seconds"),
+                "mode": signal_meta.get("mode") or ("Market-only fallback" if quote_meta else "Unavailable"),
+                "signal_label": signal_meta.get("composite_label") or label_for_signal(avg_sentiment),
+                "signal_confidence": signal_meta.get("signal_confidence"),
+                "final_reason": signal_meta.get("final_reason") or "",
             }
         )
-
     return pd.DataFrame(rows)
 
 
@@ -335,227 +833,105 @@ def build_sector_frame(compare_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def generate_demo_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    now = pd.Timestamp.now().floor("h")
-    news_rows: list[dict[str, object]] = []
-    price_rows: list[dict[str, object]] = []
-    article_id = 1
-
-    themes = [
-        ("earnings beat expectations", 0.58),
-        ("analyst upgrade lifts outlook", 0.46),
-        ("guidance cut triggers caution", -0.55),
-        ("partnership expands revenue visibility", 0.38),
-        ("margin pressure worries investors", -0.42),
-        ("product launch draws strong demand", 0.34),
-        ("regulatory headline adds uncertainty", -0.29),
-    ]
-
-    for ticker in tickers:
-        seed = int(md5(ticker.encode()).hexdigest()[:8], 16)
-        rng = np.random.default_rng(seed)
-        sector = WATCHLIST_MAP.get(ticker, {}).get("sector", "Other")
-        base_price = float(rng.uniform(80, 320))
-        timestamps = pd.date_range(end=now, periods=30 * 7, freq="4h")
-        drift = rng.normal(0.0008, 0.012, len(timestamps)).cumsum()
-        closes = base_price * (1 + drift)
-
-        for idx, ts in enumerate(timestamps):
-            close = max(10.0, float(closes[idx]))
-            open_price = close * (1 + rng.normal(0.0, 0.002))
-            high = max(open_price, close) * (1 + rng.uniform(0.001, 0.01))
-            low = min(open_price, close) * (1 - rng.uniform(0.001, 0.01))
-            volume = float(rng.integers(800_000, 12_000_000))
-            price_rows.append(
-                {
-                    "ticker": ticker,
-                    "timestamp": ts.to_pydatetime(),
-                    "open": round(open_price, 2),
-                    "high": round(high, 2),
-                    "low": round(low, 2),
-                    "close": round(close, 2),
-                    "volume": volume,
-                }
-            )
-
-        headline_times = pd.date_range(end=now, periods=18, freq="40h")
-        for ts in headline_times:
-            theme, score = themes[int(rng.integers(0, len(themes)))]
-            score = float(np.clip(score + rng.normal(0.0, 0.12), -0.95, 0.95))
-            label = "positive" if score > 0.15 else "negative" if score < -0.15 else "neutral"
-            confidence = float(np.clip(0.62 + abs(score) * 0.28 + rng.normal(0.0, 0.05), 0.52, 0.96))
-            if label == "positive":
-                positive, negative, neutral = confidence, (1 - confidence) * 0.25, (1 - confidence) * 0.75
-            elif label == "negative":
-                negative, positive, neutral = confidence, (1 - confidence) * 0.25, (1 - confidence) * 0.75
-            else:
-                neutral, positive, negative = confidence, (1 - confidence) * 0.5, (1 - confidence) * 0.5
-
-            news_rows.append(
-                {
-                    "id": article_id,
-                    "ticker": ticker,
-                    "source": "Demo Feed",
-                    "title": f"Demo: {ticker} {theme}",
-                    "summary": f"Placeholder frontend data for {ticker} in the {sector} sector.",
-                    "url": f"https://demo.local/{ticker.lower()}/{article_id}",
-                    "published_at": ts.to_pydatetime(),
-                    "sentiment_label": label,
-                    "sentiment_score": round(score, 4),
-                    "positive_score": round(positive, 4),
-                    "negative_score": round(negative, 4),
-                    "neutral_score": round(neutral, 4),
-                }
-            )
-            article_id += 1
-
-    news_df = pd.DataFrame(news_rows)
-    price_df = pd.DataFrame(price_rows)
-    news_df["published_at"] = pd.to_datetime(news_df["published_at"])
-    price_df["timestamp"] = pd.to_datetime(price_df["timestamp"])
-    return news_df, price_df
-
-
 def compute_market_mood(compare_df: pd.DataFrame) -> tuple[str, int, str]:
     if compare_df.empty:
-        return "Neutral", 50, "Insufficient data for a market-wide reading."
-
+        return "Neutral", 50, "Insufficient live data for a market-wide reading."
     mood_value = int(np.clip(((compare_df["avg_sentiment"].mean() + 1.0) / 2.0) * 100.0, 0, 100))
     if mood_value >= 60:
-        return "Bullish", mood_value, "Broad sentiment is leaning positive across the tracked names."
+        return "Bullish", mood_value, "Fresh news and composite signals lean positive across the tracked names."
     if mood_value <= 40:
-        return "Bearish", mood_value, "Risk-off tone is dominating the tracked names."
-    return "Balanced", mood_value, "Signals are mixed and the market tone is currently neutral."
+        return "Bearish", mood_value, "Fresh news and composite signals lean negative across the tracked names."
+    return "Balanced", mood_value, "Signals are mixed and no strong broad-market edge is visible."
 
 
 def build_ai_explanation(focus_ticker: str, news_df: pd.DataFrame, compare_df: pd.DataFrame) -> list[str]:
     ticker_news = news_df[news_df["ticker"] == focus_ticker].sort_values("published_at", ascending=False)
+    compare_row = compare_df[compare_df["ticker"] == focus_ticker]
+    mode = compare_row["mode"].iloc[0] if not compare_row.empty else "Unavailable"
+    quality = compare_row["quote_quality"].iloc[0] if not compare_row.empty else "unavailable"
+    exchange = compare_row["exchange"].iloc[0] if not compare_row.empty else get_exchange_for_ticker(focus_ticker)
+
     if ticker_news.empty:
         return [
-            f"{focus_ticker} has no stored headlines in the selected window.",
-            "Run the live pipeline for this ticker so the dashboard can plot real sentiment and price history.",
+            f"{get_company_name(focus_ticker)} has no fresh headlines inside the configured live-news window.",
+            f"The workspace is operating in {mode.lower()} mode, with quote quality marked {quality}.",
+            f"{exchange} selections may still show live quotes even when bar overlap analysis is not available.",
+            "Signal confidence is intentionally hidden or reduced when the app cannot ground the move in fresh provider-backed news.",
         ]
 
     avg_sentiment = float(ticker_news["sentiment_score"].mean())
-    latest = ticker_news.head(3)["title"].tolist()
-    confidence = float(ticker_news[["positive_score", "negative_score", "neutral_score"]].max(axis=1).mean() * 100.0)
-
     direction = "bullish" if avg_sentiment > 0.15 else "bearish" if avg_sentiment < -0.15 else "neutral"
-    explanation = [
-        f"{focus_ticker} currently reads as {direction} based on the recent headline mix.",
-        f"Average model confidence is {confidence:.0f}%, which suggests the signal is reasonably consistent.",
-    ]
-    if latest:
-        explanation.append(f"Recent drivers: {latest[0]}")
-    if len(latest) > 1:
-        explanation.append(f"Supporting context: {latest[1]}")
+    avg_confidence = float(confidence_series(ticker_news).mean() * 100.0)
+    avg_buy_sell = float(buy_sell_ratio_series(ticker_news).mean())
+    avg_volume_ratio = float(volume_ratio_series(ticker_news).mean())
+    latest = ticker_news.iloc[0]
 
-    if not compare_df.empty and "avg_sentiment" in compare_df.columns and "ticker" in compare_df.columns:
-        peer_rank = compare_df.sort_values("avg_sentiment", ascending=False).reset_index(drop=True)
-        if focus_ticker in peer_rank["ticker"].tolist():
-            rank = int(peer_rank.index[peer_rank["ticker"] == focus_ticker][0]) + 1
-            explanation.append(f"Peer position: ranked {rank} on sentiment across the compared tickers.")
-    return explanation
+    lines = [
+        f"{get_company_name(focus_ticker)} currently reads as a {direction} short-term signal.",
+        f"Fresh analyzed headlines average {avg_confidence:.0f}% confidence, with buy/sell pressure near {avg_buy_sell:.2f}x and volume context around {avg_volume_ratio:.2f}x.",
+        f"Latest driver: {latest['title']}",
+    ]
+    if pd.notna(latest.get("short_reason")) and str(latest.get("short_reason")).strip():
+        lines.append(f"Why it matters: {latest['short_reason']}")
+    return lines
 
 
 def build_alerts(compare_df: pd.DataFrame, event_df: pd.DataFrame, alert_threshold: int) -> list[dict[str, str]]:
     alerts: list[dict[str, str]] = []
-
     for _, row in compare_df.iterrows():
         sentiment_index = int(np.clip(((row["avg_sentiment"] + 1.0) / 2.0) * 100.0, 0, 100))
-        if sentiment_index < alert_threshold:
+        if row["signal_label"] == "bearish":
             alerts.append(
                 {
-                    "title": f'{row["ticker"]} sentiment dropped below {alert_threshold}',
-                    "detail": f'Market mood proxy is {sentiment_index} with {row["pct_change"]:.2f}% price change.',
+                    "title": f'{row["name"]} flipped bearish',
+                    "detail": f'Short-term signal is bearish with mode {row["mode"]} and quote quality {row["quote_quality"]}.',
                 }
             )
-        if row["pct_change"] <= -2.0:
+        if pd.notna(row["avg_confidence"]) and row["avg_confidence"] >= alert_threshold:
             alerts.append(
                 {
-                    "title": f'{row["ticker"]} price pressure detected',
-                    "detail": f'Price moved {row["pct_change"]:.2f}% over the selected window.',
+                    "title": f'{row["name"]} confidence crossed {alert_threshold}%',
+                    "detail": f'Composite signal confidence is {row["avg_confidence"]:.0f}% with {int(row["news_volume"])} fresh headlines.',
                 }
             )
-        if row["news_volume"] >= 12:
+        if row["pct_change"] <= -2.0 and row["avg_sentiment"] > 0.15:
             alerts.append(
                 {
-                    "title": f'{row["ticker"]} has elevated news volume',
-                    "detail": f'{int(row["news_volume"])} headlines were captured in the current window.',
+                    "title": f'{row["name"]} price/news divergence',
+                    "detail": f'Price moved {row["pct_change"]:.2f}% while sentiment stayed positive, suggesting watch-level disagreement.',
                 }
             )
-
     if not event_df.empty:
-        negative_events = event_df.sort_values("impact_pct").head(2)
-        for _, row in negative_events.iterrows():
+        strongest = event_df.sort_values("impact_pct").head(2)
+        for _, row in strongest.iterrows():
             alerts.append(
                 {
                     "title": f'Headline impact watch: {row["ticker"]}',
                     "detail": f'{row["title"]} | estimated 1h impact {row["impact_pct"]:.2f}%',
                 }
             )
-
     deduped: list[dict[str, str]] = []
-    seen_titles: set[str] = set()
+    seen: set[str] = set()
     for alert in alerts:
-        if alert["title"] in seen_titles:
+        if alert["title"] in seen:
             continue
         deduped.append(alert)
-        seen_titles.add(alert["title"])
+        seen.add(alert["title"])
     return deduped[:6]
-
-
-def build_top_panel(compare_df: pd.DataFrame, column: str, ascending: bool, value_fmt: str) -> list[dbc.ListGroupItem]:
-    if compare_df.empty:
-        return [dbc.ListGroupItem("No data available for this panel.")]
-
-    rows = compare_df.sort_values(column, ascending=ascending).head(4)
-    items: list[dbc.ListGroupItem] = []
-    for _, row in rows.iterrows():
-        items.append(
-            dbc.ListGroupItem(
-                [
-                    html.Div(row["ticker"], className="panel-symbol"),
-                    html.Div(row["name"], className="panel-name"),
-                    html.Div(value_fmt.format(row[column]), className="panel-value"),
-                ],
-                className="panel-item",
-            )
-        )
-    return items
 
 
 def build_metric_cards(compare_df: pd.DataFrame, event_df: pd.DataFrame) -> list[dbc.Col]:
     mood_label, mood_score, mood_note = compute_market_mood(compare_df)
-    avg_confidence = float(compare_df["avg_confidence"].mean()) if not compare_df.empty else 0.0
+    avg_confidence = float(compare_df["avg_confidence"].dropna().mean()) if not compare_df.empty else 0.0
     avg_return = float(compare_df["pct_change"].mean()) if not compare_df.empty else 0.0
-    event_corr = float(event_df["sentiment_score"].corr(event_df["forward_return"])) if not event_df.empty else np.nan
-
+    avg_spread = float(compare_df["avg_spread_pct"].mean()) if not compare_df.empty else 0.0
     metrics = [
         ("Market Mood Index", f"{mood_score}", mood_label),
-        ("Model Confidence", f"{avg_confidence:.0f}%", "FinBERT signal reliability"),
-        ("Average Window Return", f"{avg_return:.2f}%", "Compared stocks"),
-        (
-            "Sentiment / Return Corr",
-            f"{event_corr:.2f}" if pd.notna(event_corr) else "n/a",
-            mood_note,
-        ),
+        ("Signal Confidence", f"{avg_confidence:.0f}%", "Composite signal certainty across the active workspace"),
+        ("Average Window Return", f"{avg_return:.2f}%", "Selected live price window"),
+        ("Average Spread", f"{avg_spread:.2f}%", mood_note),
     ]
-
-    return [
-        dbc.Col(
-            html.Div(
-                [
-                    html.Div(title, className="metric-label"),
-                    html.Div(value, className="metric-value"),
-                    html.Div(note, className="metric-note"),
-                ],
-                className="metric-card",
-            ),
-            md=3,
-        )
-        for title, value, note in metrics
-    ]
+    return build_metric_grid(metrics, column_size=3)
 
 
 def build_sentiment_timeline(news_df: pd.DataFrame) -> go.Figure:
@@ -567,14 +943,10 @@ def build_sentiment_timeline_with_title(news_df: pd.DataFrame, title: str) -> go
     sparse_series = False
     if not news_df.empty:
         work = news_df.copy()
-        work["day"] = work["published_at"].dt.floor("D")
+        work["day"] = pd.to_datetime(work["published_at"], errors="coerce").dt.floor("D")
         grouped = (
             work.groupby(["ticker", "day"], as_index=False)
-            .agg(
-                sentiment=("sentiment_score", "mean"),
-                confidence=("positive_score", "mean"),
-                headline_count=("title", "count"),
-            )
+            .agg(sentiment=("sentiment_score", "mean"), headline_count=("title", "count"))
         )
         for ticker in sorted(grouped["ticker"].unique()):
             subset = grouped[grouped["ticker"] == ticker]
@@ -585,20 +957,10 @@ def build_sentiment_timeline_with_title(news_df: pd.DataFrame, title: str) -> go
                         x=subset["day"],
                         y=subset["sentiment"],
                         name=ticker,
-                        marker_color=np.where(
-                            subset["sentiment"] >= 0,
-                            PALETTE["bull"],
-                            PALETTE["bear"],
-                        ),
+                        marker_color=np.where(subset["sentiment"] >= 0, PALETTE["bull"], PALETTE["bear"]),
                         opacity=0.8,
                         customdata=subset[["headline_count"]],
-                        hovertemplate=(
-                            "<b>%{x|%d %b %Y}</b><br>"
-                            "Sentiment: %{y:.2f}<br>"
-                            "Headlines: %{customdata[0]}<extra>"
-                            + ticker
-                            + "</extra>"
-                        ),
+                        hovertemplate="<b>%{x|%d %b %Y}</b><br>Sentiment: %{y:.2f}<br>Headlines: %{customdata[0]}<extra>%{fullData.name}</extra>",
                     )
                 )
             else:
@@ -610,16 +972,9 @@ def build_sentiment_timeline_with_title(news_df: pd.DataFrame, title: str) -> go
                         name=ticker,
                         line={"width": 3},
                         customdata=subset[["headline_count"]],
-                        hovertemplate=(
-                            "<b>%{x|%d %b %Y}</b><br>"
-                            "Sentiment: %{y:.2f}<br>"
-                            "Headlines: %{customdata[0]}<extra>"
-                            + ticker
-                            + "</extra>"
-                        ),
+                        hovertemplate="<b>%{x|%d %b %Y}</b><br>Sentiment: %{y:.2f}<br>Headlines: %{customdata[0]}<extra>%{fullData.name}</extra>",
                     )
                 )
-
     fig.update_layout(
         title=title,
         paper_bgcolor=PALETTE["paper"],
@@ -649,7 +1004,6 @@ def build_overlay_chart(focus_ticker: str, price_df: pd.DataFrame, news_df: pd.D
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     ticker_prices = price_df[price_df["ticker"] == focus_ticker]
     ticker_news = news_df[news_df["ticker"] == focus_ticker]
-
     if not ticker_prices.empty:
         fig.add_trace(
             go.Scatter(
@@ -667,17 +1021,12 @@ def build_overlay_chart(focus_ticker: str, price_df: pd.DataFrame, news_df: pd.D
                 x=ticker_news["published_at"],
                 y=ticker_news["sentiment_score"],
                 name="Headline Sentiment",
-                marker_color=np.where(
-                    ticker_news["sentiment_score"] >= 0,
-                    PALETTE["bull"],
-                    PALETTE["bear"],
-                ),
+                marker_color=np.where(ticker_news["sentiment_score"] >= 0, PALETTE["bull"], PALETTE["bear"]),
                 opacity=0.55,
                 hovertext=ticker_news["title"],
             ),
             secondary_y=True,
         )
-
     fig.update_layout(
         title=f"Price vs Sentiment Overlay • {focus_ticker}",
         paper_bgcolor=PALETTE["paper"],
@@ -692,8 +1041,11 @@ def build_overlay_chart(focus_ticker: str, price_df: pd.DataFrame, news_df: pd.D
     return fig
 
 
-def build_impact_scatter(event_df: pd.DataFrame) -> go.Figure:
+def build_impact_scatter(event_df: pd.DataFrame, news_df: pd.DataFrame | None = None) -> go.Figure:
     fig = go.Figure()
+    fallback_news_df = pd.DataFrame()
+    mixed_modes = False
+
     if not event_df.empty:
         for ticker in sorted(event_df["ticker"].unique()):
             subset = event_df[event_df["ticker"] == ticker]
@@ -707,7 +1059,34 @@ def build_impact_scatter(event_df: pd.DataFrame) -> go.Figure:
                     text=subset["title"],
                 )
             )
+        if news_df is not None and not news_df.empty and "dedupe_hash" in event_df.columns and "dedupe_hash" in news_df.columns:
+            overlap_hashes = set(event_df["dedupe_hash"].dropna().astype(str).tolist())
+            fallback_news_df = news_df[
+                ~news_df["dedupe_hash"].fillna("").astype(str).isin(overlap_hashes)
+            ].copy()
+            mixed_modes = not fallback_news_df.empty
+    elif news_df is not None and not news_df.empty:
+        fallback_news_df = news_df.copy()
 
+    if not fallback_news_df.empty:
+        for ticker in sorted(fallback_news_df["ticker"].unique()):
+            subset = fallback_news_df[fallback_news_df["ticker"] == ticker]
+            fig.add_trace(
+                go.Scatter(
+                    x=subset["sentiment_score"],
+                    y=pd.to_numeric(subset.get("impact_strength"), errors="coerce").fillna(0.0) * 100.0,
+                    mode="markers",
+                    name=f"{ticker} (estimated)" if mixed_modes else ticker,
+                    marker={
+                        "size": np.clip(confidence_series(subset) * 100.0, 10, 26),
+                        "opacity": 0.75,
+                        "symbol": "circle-open" if mixed_modes else "circle",
+                        "line": {"width": 2, "color": PALETTE["line"]},
+                    },
+                    text=subset["title"],
+                    hovertemplate="<b>%{text}</b><br>Sentiment: %{x:.2f}<br>Estimated impact: %{y:.2f}%<extra>%{fullData.name}</extra>",
+                )
+            )
     fig.update_layout(
         title="Sentiment vs Estimated Impact",
         paper_bgcolor=PALETTE["paper"],
@@ -715,7 +1094,7 @@ def build_impact_scatter(event_df: pd.DataFrame) -> go.Figure:
         font={"color": PALETTE["ink"]},
         margin={"l": 32, "r": 24, "t": 56, "b": 28},
         xaxis={"title": "Sentiment Score", "gridcolor": PALETTE["grid"]},
-        yaxis={"title": "Estimated 1H Impact %", "gridcolor": PALETTE["grid"]},
+        yaxis={"title": "Observed / Estimated 1H Impact %", "gridcolor": PALETTE["grid"]},
     )
     return fig
 
@@ -728,15 +1107,16 @@ def build_sector_heatmap(sector_df: pd.DataFrame) -> go.Figure:
                 z=[sector_df["sentiment"].tolist()],
                 x=sector_df["sector"].tolist(),
                 y=["Sector Mood"],
-                text=[[f'{row["sector"]}<br>Sentiment {row["sentiment"]:.2f}<br>Return {row["performance"]:.2f}%'
-                       for _, row in sector_df.iterrows()]],
+                text=[[
+                    f'{row["sector"]}<br>Sentiment {row["sentiment"]:.2f}<br>Return {row["performance"]:.2f}%'
+                    for _, row in sector_df.iterrows()
+                ]],
                 hoverinfo="text",
                 colorscale=[[0.0, "#c0392b"], [0.5, "#f3d9a6"], [1.0, "#148f77"]],
                 zmin=-1,
                 zmax=1,
             )
         )
-
     fig.update_layout(
         title="Sector Heatmap",
         paper_bgcolor=PALETTE["paper"],
@@ -751,22 +1131,8 @@ def build_compare_chart(compare_df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if not compare_df.empty:
         ordered = compare_df.sort_values("pct_change", ascending=False)
-        fig.add_trace(
-            go.Bar(
-                x=ordered["ticker"],
-                y=ordered["avg_sentiment"],
-                name="Sentiment",
-                marker_color=PALETTE["bull"],
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                x=ordered["ticker"],
-                y=ordered["pct_change"],
-                name="Return %",
-                marker_color=PALETTE["accent_2"],
-            )
-        )
+        fig.add_trace(go.Bar(x=ordered["ticker"], y=ordered["avg_sentiment"], name="Sentiment", marker_color=PALETTE["bull"]))
+        fig.add_trace(go.Bar(x=ordered["ticker"], y=ordered["pct_change"], name="Return %", marker_color=PALETTE["accent_2"]))
         fig.add_trace(
             go.Scatter(
                 x=ordered["ticker"],
@@ -778,7 +1144,6 @@ def build_compare_chart(compare_df: pd.DataFrame) -> go.Figure:
                 yaxis="y2",
             )
         )
-
     fig.update_layout(
         title="Signal Snapshot",
         barmode="group",
@@ -812,16 +1177,7 @@ def build_price_timeline(
                 start_close = float(subset["close"].iloc[0])
                 if start_close:
                     y_values = (subset["close"] / start_close) * 100.0
-            fig.add_trace(
-                go.Scatter(
-                    x=subset["timestamp"],
-                    y=y_values,
-                    mode="lines",
-                    name=ticker,
-                    line={"width": 3},
-                )
-            )
-
+            fig.add_trace(go.Scatter(x=subset["timestamp"], y=y_values, mode="lines", name=ticker, line={"width": 3}))
     fig.update_layout(
         title=title,
         paper_bgcolor=PALETTE["paper"],
@@ -835,15 +1191,110 @@ def build_price_timeline(
     return fig
 
 
+def build_recent_price_histogram(
+    price_df: pd.DataFrame,
+    focus_ticker: str | None = None,
+    days: int = 7,
+    title: str = "Last 7 Trading Days",
+) -> go.Figure:
+    work = price_df.copy()
+    if focus_ticker:
+        work = work[work["ticker"] == focus_ticker]
+    if work.empty:
+        return build_empty_figure(title, "No live market price history is available for the current window.")
+
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce")
+    numeric_columns = ["open", "high", "low", "close", "volume"]
+    for column in numeric_columns:
+        if column in work.columns:
+            work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
+    if work.empty:
+        return build_empty_figure(title, "No live market price history is available for the current window.")
+
+    work["day"] = work["timestamp"].dt.floor("D")
+    daily = (
+        work.groupby("day", as_index=False)
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        )
+        .tail(days)
+        .copy()
+    )
+    if daily.empty:
+        return build_empty_figure(title, "No live market price history is available for the current window.")
+    daily["label"] = daily["day"].dt.strftime("%d %b")
+    value_floor = float(daily["close"].min()) if not daily["close"].empty else 0.0
+    value_ceiling = float(daily["close"].max()) if not daily["close"].empty else 0.0
+    padding = max((value_ceiling - value_floor) * 0.12, max(value_ceiling, 1.0) * 0.02)
+
+    fig = go.Figure(
+        go.Bar(
+            x=daily["label"],
+            y=daily["close"],
+            marker_color=PALETTE["bull"],
+            text=[f"{value:.2f}" for value in daily["close"]],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=daily[["high", "low", "volume"]].fillna(0.0).to_numpy(),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Close: %{y:.2f}<br>"
+                "High: %{customdata[0]:.2f}<br>"
+                "Low: %{customdata[1]:.2f}<br>"
+                "Volume: %{customdata[2]:,.0f}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        paper_bgcolor=PALETTE["paper"],
+        plot_bgcolor=PALETTE["paper"],
+        font={"color": PALETTE["ink"]},
+        margin={"l": 32, "r": 24, "t": 56, "b": 28},
+        showlegend=False,
+        bargap=0.38,
+        xaxis={
+            "title": "",
+            "type": "category",
+            "gridcolor": "rgba(0,0,0,0)",
+            "tickangle": 0,
+            "categoryorder": "array",
+            "categoryarray": daily["label"].tolist(),
+        },
+        yaxis={
+            "title": "Close",
+            "gridcolor": PALETTE["grid"],
+            "range": [max(value_floor - padding, 0.0), value_ceiling + padding],
+        },
+    )
+    if len(daily) < days:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=1,
+            y=1.14,
+            showarrow=False,
+            xanchor="right",
+            text=f"Showing {len(daily)} available trading days",
+            font={"size": 12, "color": PALETTE["muted"]},
+        )
+    fig.update_traces(
+        marker_line_width=0,
+        hoverlabel={"bgcolor": PALETTE["paper"], "font_color": PALETTE["ink"]},
+    )
+    return fig
+
+
 def build_metric_grid(items: list[tuple[str, str, str]], column_size: int = 3) -> list[dbc.Col]:
     return [
         dbc.Col(
             html.Div(
-                [
-                    html.Div(title, className="metric-label"),
-                    html.Div(value, className="metric-value"),
-                    html.Div(note, className="metric-note"),
-                ],
+                [html.Div(title, className="metric-label"), html.Div(value, className="metric-value"), html.Div(note, className="metric-note")],
                 className="metric-card",
             ),
             md=6,
@@ -863,112 +1314,152 @@ def build_empty_figure(title: str, message: str) -> go.Figure:
         margin={"l": 32, "r": 24, "t": 56, "b": 28},
         xaxis={"visible": False},
         yaxis={"visible": False},
-        annotations=[
-            {
-                "text": message,
-                "xref": "paper",
-                "yref": "paper",
-                "x": 0.5,
-                "y": 0.5,
-                "showarrow": False,
-                "font": {"size": 14, "color": PALETTE["muted"]},
-            }
-        ],
+        annotations=[{"text": message, "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5, "showarrow": False, "font": {"size": 14, "color": PALETTE["muted"]}}],
     )
     return fig
 
 
 def build_summary_list(items: list[tuple[str, str]]) -> list[html.Div]:
     return [
-        html.Div(
-            [
-                html.Div(label, className="summary-label"),
-                html.Div(value, className="summary-value"),
-            ],
-            className="summary-item",
-        )
+        html.Div([html.Div(label, className="summary-label"), html.Div(value, className="summary-value")], className="summary-item")
         for label, value in items
     ]
 
 
-def build_news_table(event_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFrame:
-    if not event_df.empty:
-        work = event_df.sort_values("published_at", ascending=False).copy()
-        work["confidence_pct"] = work["confidence_pct"].round(1)
-        work["impact_pct"] = work["impact_pct"].round(2)
-        work["published_at"] = pd.to_datetime(work["published_at"]).dt.strftime("%Y-%m-%d %H:%M")
-        work["source"] = work.get("source", "Unknown")
-        work["explanation"] = np.where(
-            work["sentiment_score"] > 0.2,
-            "Positive catalyst cluster",
-            np.where(work["sentiment_score"] < -0.2, "Negative catalyst cluster", "Mixed or neutral tone"),
-        )
-        return work[
-            ["published_at", "ticker", "source", "title", "sentiment_label", "confidence_pct", "impact_pct", "explanation"]
-        ].rename(
-            columns={
-                "published_at": "Time",
-                "ticker": "Ticker",
-                "source": "Source",
-                "title": "Headline",
-                "sentiment_label": "Sentiment",
-                "confidence_pct": "Confidence %",
-                "impact_pct": "Impact %",
-                "explanation": "Explanation",
-            }
+def build_buy_readout(focus_ticker: str, compare_df: pd.DataFrame) -> html.Div:
+    focus_row = compare_df[compare_df["ticker"] == focus_ticker]
+    if focus_row.empty:
+        return html.Div(
+            "No final read is available yet because the workspace does not have enough live signal data.",
+            className="explanation-line",
         )
 
-    if news_df.empty:
-        return pd.DataFrame(columns=["Time", "Ticker", "Source", "Headline", "Sentiment", "Confidence %", "Impact %", "Explanation"])
+    row = focus_row.iloc[0]
+    score = float(row.get("avg_sentiment") or 0.0)
+    confidence = float(row.get("signal_confidence") or 0.0) * 100.0 if pd.notna(row.get("signal_confidence")) else float(row.get("avg_confidence") or 0.0)
+    mode = str(row.get("mode") or "Unavailable")
+    quote_quality = str(row.get("quote_quality") or "unavailable")
+    news_quality = str(row.get("news_quality") or "unavailable")
+    label = str(row.get("signal_label") or "neutral").strip().lower()
+    pct_change = float(row.get("pct_change") or 0.0)
+    reason = str(row.get("final_reason") or "").strip()
 
-    fallback = news_df.sort_values("published_at", ascending=False).copy()
-    fallback["Time"] = pd.to_datetime(fallback["published_at"]).dt.strftime("%Y-%m-%d %H:%M")
-    fallback["Source"] = fallback.get("source", "Unknown")
-    fallback["Confidence %"] = (
-        fallback[["positive_score", "negative_score", "neutral_score"]].max(axis=1).fillna(0.0) * 100.0
-    ).round(1)
-    fallback["Impact %"] = "n/a"
-    fallback["Explanation"] = "Price linkage unavailable for this headline in the current window."
-    return fallback[["Time", "ticker", "Source", "title", "sentiment_label", "Confidence %", "Impact %", "Explanation"]].rename(
-        columns={"ticker": "Ticker", "title": "Headline", "sentiment_label": "Sentiment"}
+    if label in {"bullish", "positive"} and confidence >= 60 and mode == "Market + News":
+        verdict = "Buy"
+        tone = f"{focus_ticker} has a constructive short-term setup right now."
+    elif label in {"bearish", "negative"} and confidence >= 55:
+        verdict = "Avoid"
+        tone = f"{focus_ticker} does not look attractive for a short-term entry right now."
+    else:
+        verdict = "Watch"
+        tone = f"{focus_ticker} is better treated as a watchlist name until the signal strengthens."
+
+    confidence_text = (
+        f"Signal confidence is {confidence:.0f}%"
+        if pd.notna(confidence) and confidence > 0
+        else "Signal confidence is still limited"
     )
+    support_line = (
+        f"{confidence_text}, with mode {mode}, quote quality {quote_quality}, news quality {news_quality}, "
+        f"and a recent window move of {pct_change:.2f}%."
+    )
+    caution_line = (
+        "This is a short-term project signal built from live quotes plus headline analysis, not a financial-advice recommendation."
+    )
+    if reason:
+        support_line = f"{support_line} Primary driver: {reason}"
+
+    return html.Div(
+        [
+            html.Div("Final Read", className="section-kicker"),
+            html.Div(f"{verdict} • {tone}", className="summary-value", style={"textAlign": "left"}),
+            html.Div(support_line, className="explanation-line"),
+            html.Div(caution_line, className="explanation-line"),
+        ],
+        className="summary-stack",
+    )
+
+
+def build_news_table(event_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFrame:
+    if news_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Time",
+                "Age",
+                "Ticker",
+                "Provider",
+                "Source",
+                "Headline",
+                "Sentiment",
+                "Confidence %",
+                "Impact %",
+                "Catalyst",
+                "Analysis",
+                "Parse Status",
+                "Explanation",
+            ]
+        )
+
+    table_df = news_df.sort_values("published_at", ascending=False).copy()
+
+    if not event_df.empty:
+        event_cols = [
+            col
+            for col in ["dedupe_hash", "confidence_pct", "impact_pct", "forward_return", "market_timestamp", "future_timestamp"]
+            if col in event_df.columns
+        ]
+        event_link = event_df[event_cols].drop_duplicates(subset=["dedupe_hash"]) if "dedupe_hash" in event_cols else pd.DataFrame()
+        if not event_link.empty:
+            table_df = table_df.merge(event_link, how="left", on="dedupe_hash")
+
+    table_df["Time"] = pd.to_datetime(table_df["published_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    table_df["Age"] = pd.to_datetime(table_df["published_at"]).apply(format_age_from_timestamp)
+    table_df["Ticker"] = table_df["ticker"]
+    table_df["Provider"] = table_df.get("provider", "Unknown")
+    table_df["Source"] = table_df.get("source", "Unknown")
+    table_df["Headline"] = table_df["title"]
+    table_df["Sentiment"] = table_df.get("sentiment_label", "neutral").astype(str).str.title()
+    if "confidence_pct" in table_df.columns:
+        confidence_values = pd.to_numeric(table_df["confidence_pct"], errors="coerce")
+    else:
+        confidence_values = pd.Series(index=table_df.index, dtype=float)
+    table_df["Confidence %"] = confidence_values.fillna(confidence_series(table_df) * 100.0).round(1)
+    if "impact_pct" in table_df.columns:
+        impact_series = pd.to_numeric(table_df["impact_pct"], errors="coerce")
+        table_df["Impact %"] = impact_series.round(2).astype(object)
+        table_df.loc[impact_series.isna(), "Impact %"] = "n/a"
+    else:
+        table_df["Impact %"] = "n/a"
+    table_df["Catalyst"] = table_df.get("catalyst_tag", "other").fillna("other")
+    table_df["Analysis"] = table_df.get("analysis_provider", "Unknown")
+    table_df["Parse Status"] = table_df.get("parse_status", "n/a").fillna("n/a")
+    table_df["Explanation"] = table_df.get("short_reason", "").fillna("Awaiting price linkage for this headline.")
+    return table_df[
+        [
+            "Time",
+            "Age",
+            "Ticker",
+            "Provider",
+            "Source",
+            "Headline",
+            "Sentiment",
+            "Confidence %",
+            "Impact %",
+            "Catalyst",
+            "Analysis",
+            "Parse Status",
+            "Explanation",
+        ]
+    ]
 
 
 def build_alert_panel(alerts: list[dict[str, str]], demo_mode: bool) -> list[dbc.ListGroupItem]:
     if not alerts:
-        label = "No watchlist alerts in the selected window."
-        return [dbc.ListGroupItem(label)]
-
+        return [dbc.ListGroupItem("No watchlist alerts in the selected window.")]
     return [
-        dbc.ListGroupItem(
-            [html.Div(alert["title"], className="alert-title"), html.Div(alert["detail"], className="alert-detail")],
-            className="alert-item",
-        )
+        dbc.ListGroupItem([html.Div(alert["title"], className="alert-title"), html.Div(alert["detail"], className="alert-detail")], className="alert-item")
         for alert in alerts
     ]
-
-
-def build_research_card() -> html.Div:
-    return html.Div(
-        [
-            html.Div("Research Grounding", className="section-kicker"),
-            html.H4("Why This Dashboard Has Academic Weight", className="section-title"),
-            html.Ul(
-                [
-                    html.Li("FinBERT: domain-specific financial sentiment modeling."),
-                    html.Li("Financial PhraseBank: benchmark dataset behind financial sentiment labeling."),
-                    html.Li("News Sentiment for Stock Prediction: validates sentiment-driven price analysis."),
-                    html.Li("Investor Sentiment and Stock Returns: theoretical support for market impact effects."),
-                ],
-                className="research-list",
-            ),
-            html.P(
-                "Paper selection is anchored on financial NLP, sentiment-price correlation, and scalable analytics visualization.",
-                className="research-note",
-            ),
-        ],
-        className="research-card",
-    )
 
 
 def get_assets_folder() -> str:

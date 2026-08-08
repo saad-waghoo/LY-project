@@ -19,15 +19,16 @@ def layout() -> html.Div:
                 ],
                 className="section-shell page-header-shell mb-3",
             ),
+            html.Div(id="summary-status-banner", className="mb-3"),
             dbc.Row(id="summary-metric-row", className="g-3 mb-3"),
             dbc.Row(
                 [
                     dbc.Col(
                         html.Div(
                             [
-                                html.Div("Sentiment Timeline", className="section-kicker"),
-                                html.H3("Recent Tone", className="section-title"),
-                                dcc.Graph(id="summary-sentiment-chart"),
+                                html.Div("7-Day Price", className="section-kicker"),
+                                html.H3("Daily Close", className="section-title"),
+                                dcc.Graph(id="summary-price-chart"),
                             ],
                             className="chart-card",
                         ),
@@ -36,7 +37,7 @@ def layout() -> html.Div:
                     dbc.Col(
                         html.Div(
                             [
-                                html.Div("AI Explanation", className="section-kicker"),
+                                html.Div("Signal Notes", className="section-kicker"),
                                 html.H3("Why The Signal Looks This Way", className="section-title"),
                                 html.Div(id="summary-ai-explanation", className="explanation-box compact"),
                             ],
